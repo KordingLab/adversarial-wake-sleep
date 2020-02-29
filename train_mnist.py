@@ -8,14 +8,11 @@ import torch.nn as nn
 from train_utils_mnist import engage_new_layer, get_batch_of_real, generate_some_images
 from mnist_fid import LeNet5, calculate_mnist_fid
 from mnist_models import DeterministicHelmholtz, Discriminator
+from utils import sv_img
 
 import argparse
 import os
-import random
-import shutil
-import time
-import warnings
-import pickle
+
 
 
 parser = argparse.ArgumentParser(description='PyTorch Adversarial Wake-Sleep Training on MNIST')
@@ -35,6 +32,8 @@ parser.add_argument('--lr-d', '--learning-rate-discriminator', default=5e-4, typ
 parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)',
                     dest='wd')
+parser.add_argument('--beta1',  default=.5, type=float,
+                    help='In the adam optimizer. Default = 0.5')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
                     help='number of total epochs to run. Default 90')
 parser.add_argument('--sequential-training', action='store_true',
@@ -51,12 +50,23 @@ parser.add_argument('--disc-hidden-dim', default=256, type=int,
 parser.add_argument('--surprisal-sigma', default=1, type=float,
                     metavar='ss', help='How weakly to follow the gradient of the surprisal of the lower layers '
                      'given the upper layers inference activations and the generative model.'
-                     ' Specifically the variance of the implied Gaussian noise of the output (but there is no noise.')
+                     ' Specifically the variance of the implied Gaussian noise of the output (but there is no noise.'
+             ' Equivalent to minimizing the reconstruction error from inference states, up one layer, and back down.')
+parser.add_argument('--minimize-generator-surprisal', action='store_true',
+                    help='Minimize generator surprisal using value of sigma set.')
 parser.add_argument('--lamda', default=.1, type=float,
                     help='Lambda for the gradient penalty in the WGAN formulation. Only for Wasserstein loss.')
 parser.add_argument('--no-backprop-through-full-cortex', action='store_true',
                     help='Only backprop through the local (layerwise) discriminator to parameters in that same '
                      'layer of the cortex. For biological plausibility.')
+parser.add_argument('--label-smoothing', action='store_true',
+                    help='Make the discriminator be less confident by randomly switching labels with p=.1')
+parser.add_argument('--noise-sigma', default=0, type=float,
+                    help='If set, add Gaussian noise with this variance to the pre-Relu activations of both passes.')
+
+
+
+# printing and saving
 parser.add_argument('--print-fid', action='store_true',
                     help='Calculate and return the FID score on MNIST using a pretrained LeNet')
 parser.add_argument('--quiet', action='store_true',
@@ -65,6 +75,10 @@ parser.add_argument("--savename",
                         help = "Relative path to a folde-dr in which to save the model, discriminator, and history",
                         type = str,
                         default = './cortex_disc_and_development.pickle')
+parser.add_argument('--save-imgs', action='store_true',
+                    help='Save the generated images every epoch')
+
+
 
 def train(args, cortex, train_loader, discriminator, train_history,
           optimizerD, optimizerG, optimizerF, epoch, ml_after_epoch=-1):
@@ -110,13 +124,21 @@ def train(args, cortex, train_loader, discriminator, train_history,
 
         generated_input = cortex.noise_and_generate(noise_layer)
 
+        if args.label_smoothing:
+            #with prob .1 we switch the labels
+            p = torch.ones(batch_size,1) * .9
+            alpha = torch.bernoulli(p) * 2 - 1
+        else:
+            alpha = torch.ones(batch_size,1)
+        alpha = alpha.to(real_samples.device)
+
         # check out what the discriminator says
         if args.loss_type == 'hinge':
-            disc_loss = nn.ReLU()(1.0 - discriminator(cortex.inference.get_detached_state_dict())).mean() + \
-                        nn.ReLU()(1.0 + discriminator(cortex.generator.get_detached_state_dict())).mean()
+            disc_loss = nn.ReLU()(1.0 - alpha * discriminator(cortex.inference.get_detached_state_dict())).mean() + \
+                        nn.ReLU()(1.0 + alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
         elif args.loss_type == 'wasserstein':
-            disc_loss = -discriminator(cortex.inference.get_detached_state_dict()).mean() + \
-                        discriminator(cortex.generator.get_detached_state_dict()).mean()
+            disc_loss = -(alpha * discriminator(cortex.inference.get_detached_state_dict())).mean() + \
+                         (alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
 
             # train with gradient penalty
             gradient_penalty = discriminator.get_gradient_penalty(
@@ -127,18 +149,20 @@ def train(args, cortex, train_loader, discriminator, train_history,
             d_inf = discriminator(cortex.inference.get_detached_state_dict())
             d_gen = discriminator(cortex.generator.get_detached_state_dict())
 
-            disc_loss = nn.BCELoss()(d_inf, Variable(torch.ones(batch_size, 1).cuda(args.gpu))) + \
-                        nn.BCELoss()(d_gen, Variable(torch.zeros(batch_size, 1).cuda(args.gpu)))
+            p = .9 if args.label_smoothing else 1
+
+            disc_loss = nn.BCELoss()(d_inf, p * Variable(torch.ones(batch_size, 1).to(real_samples.device))) + \
+                        nn.BCELoss()(d_gen, (1-p) * Variable(torch.ones(batch_size, 1).to(real_samples.device)))
 
         # now update the inference and generator to fight the discriminator
 
         if args.loss_type == 'hinge' or args.loss_type == 'wasserstein':
-            gen_loss = -discriminator(cortex.generator.state_dict, 'generation').mean() + \
-                       discriminator(cortex.inference.state_dict, 'inference').mean()
+            gen_loss = -discriminator(cortex.generator.intermediate_state_dict, 'generation').mean() + \
+                       discriminator(cortex.inference.intermediate_state_dict, 'inference').mean()
         else:
-            gen_loss = nn.BCELoss()(discriminator(cortex.generator.state_dict),
+            gen_loss = nn.BCELoss()(discriminator(cortex.generator.intermediate_state_dict),
                                     Variable(torch.ones(batch_size, 1).cuda(args.gpu))) + \
-                       nn.BCELoss()(discriminator(cortex.inference.state_dict),
+                       nn.BCELoss()(discriminator(cortex.inference.intermediate_state_dict),
                                     Variable(torch.zeros(batch_size, 1).cuda(args.gpu)))
 
         disc_loss.backward()
@@ -170,7 +194,8 @@ def main(args):
     cortex = DeterministicHelmholtz(image_size=mnist_size, noise_dim=args.noise_dim, surprisal_sigma=args.surprisal_sigma,
                                     log_intermediate_surprisals=args.detailed_logging,
                                     log_intermediate_reconstructions=args.detailed_logging,
-                                    log_weight_alignment=args.detailed_logging).cuda(args.gpu)
+                                    log_weight_alignment=args.detailed_logging,
+                                    noise_sigma = args.noise_sigma).cuda(args.gpu)
 
     discriminator = Discriminator(args.disc_hidden_dim, cortex.layer_names, lambda_=args.lamda, loss_type=args.loss_type,
                                   noise_dim=args.noise_dim,
@@ -212,13 +237,16 @@ def main(args):
         discriminator_params = discriminator.parameters()
 
     # set up optimizer
-    optimizerD = optim.Adam(discriminator_params, lr=args.lr_d, betas=(.5, 0.999), weight_decay = args.wd)
-    optimizerG = optim.Adam(generator_params, lr=args.lr_c, betas=(.5, 0.999), weight_decay = args.wd)
-    optimizerF = optim.Adam(inference_params, lr=args.lr_c, betas=(.5, 0.999), weight_decay = args.wd)
+    optimizerD = optim.Adam(discriminator_params, lr=args.lr_d, betas=(args.beta1, 0.999), weight_decay = args.wd)
+    optimizerG = optim.Adam(generator_params,     lr=args.lr_c, betas=(args.beta1, 0.999), weight_decay = args.wd)
+    optimizerF = optim.Adam(inference_params,     lr=args.lr_c, betas=(args.beta1, 0.999), weight_decay = args.wd)
 
     for epoch in range(args.epochs):
+        e = -1 if args.minimize_generator_surprisal else epoch + 1
+
         train(args, cortex, train_loader, discriminator, train_history,
-              optimizerD, optimizerG, optimizerF, epoch, ml_after_epoch=-1)
+              optimizerD, optimizerG, optimizerF, epoch,
+              ml_after_epoch=e)
 
         if args.print_fid:
 
@@ -228,13 +256,29 @@ def main(args):
                                                       bootstrap=True)
             print("Epoch {} FID score of {} +/- {}".format(epoch, fid_score, conf_int))
 
-            # to_visualize = some_fake_images[:100].detach().cpu()
-            # grid = utils.make_grid(to_visualize,
-            #                       nrow=10, padding=2, normalize=True,
-            #                       range=None, scale_each=False, pad_value=0)
-            # show(grid, epoch)
+        if args.save_imgs:
+            try:
+                os.mkdir("gen_images")
+            except:
+                pass
+            to_visualize = cortex.noise_and_generate()[:100].detach().cpu()
+            grid = utils.make_grid(to_visualize,
+                                   nrow=10, padding=5, normalize=True,
+                                   range=None, scale_each=False, pad_value=0)
+            sv_img(grid, "gen_images/imgs_epoch{}.png".format(epoch), epoch)
 
-    pickle.dump((cortex, discriminator, train_history), open(args.savename, "wb"))
+        torch.save({
+            'epoch': epoch + 1,
+            'cortex_state_dict': cortex.state_dict(),
+            'discriminator_state_dict': discriminator.state_dict(),
+            'optimizerD': optimizerD.state_dict(),
+            'optimizerG': optimizerG.state_dict(),
+            'optimizerF': optimizerF.state_dict(),
+            'train_history': {"disc_loss": discriminator.intermediate_Ds,
+                              "surprisals": cortex.intermediate_surprisals,
+                              "reconstructions": cortex.intermediate_reconstructions,
+                              "weight_alignment": cortex.weight_alignment}
+        }, 'checkpoint.pth.tar')
 
 if __name__ == '__main__':
     args = parser.parse_args()
