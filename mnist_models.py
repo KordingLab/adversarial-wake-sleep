@@ -7,7 +7,7 @@ from torch.distributions import Laplace, Normal
 class Generator(nn.Module):
     # Network Architecture is exactly same as in infoGAN (https://arxiv.org/abs/1606.03657)
     # Architecture : FC1024_BR-FC7x7x128_BR-(64)4dc2s_BR-(1)4dc2s_S
-    def __init__(self, noise_dim=100, image_dim=1, image_size=32):
+    def __init__(self, noise_dim=100, image_dim=1, image_size=32, noise_sigma = 0):
         super(Generator, self).__init__()
         self.noise_dim = noise_dim
         self.image_dim = image_dim
@@ -15,18 +15,21 @@ class Generator(nn.Module):
 
         self.generative_4to3 = nn.Sequential(
             nn.Linear(self.noise_dim, 1024),
+            AddNoise(noise_sigma),
             nn.BatchNorm1d(1024),
             nn.LeakyReLU()
         )
 
         self.generative_3to2 = nn.Sequential(
             nn.Linear(1024, 128 * (self.image_size // 4) * (self.image_size // 4)),
+            AddNoise(noise_sigma),
             nn.BatchNorm1d(128 * (self.image_size // 4) * (self.image_size // 4)),
             nn.LeakyReLU(),
         )
 
         self.generative_2to1_conv = nn.Sequential(
             nn.ConvTranspose2d(128, 64, 4, 2, 1),
+            AddNoise(noise_sigma),
             nn.BatchNorm2d(64),
             nn.LeakyReLU()
         )
@@ -37,40 +40,55 @@ class Generator(nn.Module):
         )
         initialize_weights(self)
 
-        self.state_dict = {'Input': None,
+        self.intermediate_state_dict = {'Input': None,
                            'Layer1': None,
                            'Layer2': None,
                            'Layer3': None,
                            'Layer4': None}
 
     def get_detached_state_dict(self):
-        detached_dict = {k: None if (v is None) else v.detach() for k, v in self.state_dict.items()}
+        detached_dict = {k: None if (v is None) else v.detach() for k, v in self.intermediate_state_dict.items()}
         return detached_dict
 
     def forward(self, x):
-        self.state_dict['Layer4'] = x
+        self.intermediate_state_dict['Layer4'] = x
 
         x = self.generative_4to3(x)
-        self.state_dict['Layer3'] = x
+        self.intermediate_state_dict['Layer3'] = x
 
         x = self.generative_3to2(x)
-        self.state_dict['Layer2'] = x
+        self.intermediate_state_dict['Layer2'] = x
         # ^ layer 2 saved as FC
 
         x = x.view(-1, 128, (self.image_size // 4), (self.image_size // 4))
         x = self.generative_2to1_conv(x)
-        self.state_dict['Layer1'] = x
+        self.intermediate_state_dict['Layer1'] = x
 
         x = self.generative_1to0_conv(x)
-        self.state_dict['Input'] = x
+        self.intermediate_state_dict['Input'] = x
 
         return x
 
+class AddNoise(nn.Module):
+    """Adds zero-mean Gaussian noise of a given variance if noise_sigma is greater than 0; else do nothing."""
+    def __init__(self, noise_sigma = 0):
+        super(AddNoise, self).__init__()
+
+        if noise_sigma > 0:
+            self.noise_dist = Normal(torch.tensor([0.0]), torch.tensor([noise_sigma]))
+        else:
+            self.noise_dist = None
+
+    def forward(self, x):
+        if self.noise_dist is not None:
+            noise = self.noise_dist.sample(x.size()).to(x.device).squeeze(dim=-1)
+            x += noise
+        return x
 
 class Inference(nn.Module):
     """ Inverse architecture of the generative model"""
 
-    def __init__(self, noise_dim=100, image_dim=1, image_size=32):
+    def __init__(self, noise_dim=100, image_dim=1, image_size=32, noise_sigma = 0):
         super(Inference, self).__init__()
         self.noise_dim = noise_dim
         self.image_dim = image_dim
@@ -78,53 +96,57 @@ class Inference(nn.Module):
 
         self.inference_3to4 = nn.Sequential(
             nn.Linear(1024, self.noise_dim),
+            AddNoise(noise_sigma)
         )
 
         self.inference_2to3 = nn.Sequential(
             nn.Linear(128 * (self.image_size // 4) * (self.image_size // 4), 1024),
             nn.BatchNorm1d(1024),
+            AddNoise(noise_sigma),
             nn.LeakyReLU(),
         )
 
         self.inference_1to2_conv = nn.Sequential(
             nn.Conv2d(64, 128, 4, 2, 1),
+            AddNoise(noise_sigma),
             nn.BatchNorm2d(128),
             nn.LeakyReLU()
         )
 
         self.inference_0to1_conv = nn.Sequential(
             nn.Conv2d(self.image_dim, 64, 4, 2, 1),
+            AddNoise(noise_sigma),
             nn.BatchNorm2d(64),
             nn.LeakyReLU()
         )
         initialize_weights(self)
 
-        self.state_dict = {'Input': None,
+        self.intermediate_state_dict = {'Input': None,
                            'Layer1': None,
                            'Layer2': None,
                            'Layer3': None,
                            'Layer4': None}
 
     def get_detached_state_dict(self):
-        detached_dict = {k: None if (v is None) else v.detach() for k, v in self.state_dict.items()}
+        detached_dict = {k: None if (v is None) else v.detach() for k, v in self.intermediate_state_dict.items()}
         return detached_dict
 
     def forward(self, input):
-        self.state_dict['Input'] = input
+        self.intermediate_state_dict['Input'] = input
 
         x = self.inference_0to1_conv(input)
-        self.state_dict['Layer1'] = x
+        self.intermediate_state_dict['Layer1'] = x
 
         x = self.inference_1to2_conv(x)
         x = x.view(-1, 128 * (self.image_size // 4) * (self.image_size // 4))
-        self.state_dict['Layer2'] = x
+        self.intermediate_state_dict['Layer2'] = x
         # ^ layer 2 saved as FC
 
         x = self.inference_2to3(x)
-        self.state_dict['Layer3'] = x
+        self.intermediate_state_dict['Layer3'] = x
 
         x = self.inference_3to4(x)
-        self.state_dict['Layer4'] = x
+        self.intermediate_state_dict['Layer4'] = x
 
         return x
 
@@ -144,7 +166,8 @@ class DeterministicHelmholtz(nn.Module):
     def __init__(self, image_size, noise_dim, surprisal_sigma=1.0,
                  log_intermediate_surprisals=False,
                  log_intermediate_reconstructions=False,
-                 log_weight_alignment=False):
+                 log_weight_alignment=False,
+                 noise_sigma = 0):
         super(DeterministicHelmholtz, self).__init__()
 
         if len(image_size) == 4:
@@ -158,8 +181,8 @@ class DeterministicHelmholtz(nn.Module):
         else:
             raise NotImplementedError("Image sizes are wrong.")
 
-        self.inference = Inference(noise_dim, image_dim, image_edge_size)
-        self.generator = Generator(noise_dim, image_dim, image_edge_size)
+        self.inference = Inference(noise_dim, image_dim, image_edge_size, noise_sigma)
+        self.generator = Generator(noise_dim, image_dim, image_edge_size, noise_sigma)
 
         # list modules bottom to top. Probably a more general way
         self.generator_modules = [self.generator.generative_1to0_conv,
@@ -172,24 +195,26 @@ class DeterministicHelmholtz(nn.Module):
                                   self.inference.inference_2to3,
                                   self.inference.inference_3to4]
 
+        self.noise_dist = Normal(torch.tensor([0.0]), torch.tensor([1.0]))
         self.mse = nn.MSELoss()
+
         self.surprisal_sigma = surprisal_sigma
         self.image_size = image_edge_size
 
-        self.layer_names = list(self.inference.state_dict.keys())
+        self.layer_names = list(self.inference.intermediate_state_dict.keys())
+
+        # This could be (manually) set to log reconstructions etc. only in certain layers
+        self.which_layers = range(len(self.inference.intermediate_state_dict))
+
+        # loggers
         self.log_intermediate_surprisals = log_intermediate_surprisals
-        if log_intermediate_surprisals:
-            self.intermediate_surprisals = {layer: [] for layer in self.layer_names}
+        self.intermediate_surprisals = {layer: [] for layer in self.layer_names}
 
         self.log_intermediate_reconstructions = log_intermediate_reconstructions
-        if log_intermediate_reconstructions:
-            self.intermediate_reconstructions = {layer: [] for layer in self.layer_names}
-        self.log_weight_alignment_ = log_weight_alignment
-        if log_weight_alignment:
-            self.weight_alignment = {layer: [] for layer in self.layer_names}
+        self.intermediate_reconstructions = {layer: [] for layer in self.layer_names}
 
-        self.which_layers = range(len(self.inference.state_dict))
-        self.noise_dist = Normal(torch.tensor([0.0]), torch.tensor([1.0]))
+        self.log_weight_alignment_ = log_weight_alignment
+        self.weight_alignment = {layer: [] for layer in self.layer_names}
 
     def infer(self, x):
         return self.inference(x)
@@ -197,43 +222,43 @@ class DeterministicHelmholtz(nn.Module):
     def generate(self, x):
         return self.generator(x)
 
-    def noise_and_generate(self, noise_layer):
+    def noise_and_generate(self, noise_layer = 4):
         """Sample from a laplacian at a given layer and propagate to the bottom.
         Must supply the state size so we can get the batch size
 
         Noise_layer = int, with 0 being input and 4 being the very top
         """
 
-        if self.inference.state_dict['Input'] is None:
+        if self.inference.intermediate_state_dict['Input'] is None:
             raise AssertionError("Inference must be run first before calculating this.")
 
-        noise_layer_str = list(self.inference.state_dict.keys())[noise_layer]
+        noise_layer_str = list(self.inference.intermediate_state_dict.keys())[noise_layer]
 
-        x = self.noise_dist.sample(self.inference.state_dict[noise_layer_str].size()).to(
-            self.inference.state_dict[noise_layer_str].device)
+        x = self.noise_dist.sample(self.inference.intermediate_state_dict[noise_layer_str].size()).to(
+            self.inference.intermediate_state_dict[noise_layer_str].device)
         x = x.squeeze(dim=-1)
         # x = torch.abs(x)
 
         if noise_layer > 3:
-            self.generator.state_dict['Layer4'] = x
+            self.generator.intermediate_state_dict['Layer4'] = x
 
             x = self.generator.generative_4to3(x)
 
         if noise_layer > 2:
-            self.generator.state_dict['Layer3'] = x
+            self.generator.intermediate_state_dict['Layer3'] = x
             x = self.generator.generative_3to2(x)
 
         if noise_layer > 1:
-            self.generator.state_dict['Layer2'] = x
+            self.generator.intermediate_state_dict['Layer2'] = x
             # ^ layer 2 saved as FC
 
             x = x.view(-1, 128, (self.image_size // 4), (self.image_size // 4))
             x = self.generator.generative_2to1_conv(x)
         if noise_layer > 0:
-            self.generator.state_dict['Layer1'] = x
+            self.generator.intermediate_state_dict['Layer1'] = x
 
             x = self.generator.generative_1to0_conv(x)
-            self.generator.state_dict['Input'] = x
+            self.generator.intermediate_state_dict['Input'] = x
         else:
             raise AssertionError("Noising the input layer? that doesn't make that much sense.")
 
@@ -246,7 +271,7 @@ class DeterministicHelmholtz(nn.Module):
         # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
         # with Gaussian we have log p  = MSE between actual and predicted
 
-        if self.inference.state_dict['Input'] is None:
+        if self.inference.intermediate_state_dict['Input'] is None:
             raise AssertionError("Inference must be run first before calculating this.")
 
         ML_loss = 0
@@ -255,8 +280,8 @@ class DeterministicHelmholtz(nn.Module):
             if i not in self.which_layers and not self.log_intermediate_surprisals:
                 continue
 
-            lower_h = self.inference.state_dict[self.layer_names[i]].detach()
-            upper_h = self.inference.state_dict[self.layer_names[i + 1]].detach()
+            lower_h = self.inference.intermediate_state_dict[self.layer_names[i]].detach()
+            upper_h = self.inference.intermediate_state_dict[self.layer_names[i + 1]].detach()
 
             # layer2 is stored unraveled, so to pass through
             # to layer1 we need to reshape it
@@ -280,7 +305,7 @@ class DeterministicHelmholtz(nn.Module):
 
         For debugging purposes only; we never backprop through this."""
 
-        if self.inference.state_dict['Input'] is None:
+        if self.inference.intermediate_state_dict['Input'] is None:
             raise AssertionError("Inference must be run first before calculating this.")
 
         if self.log_intermediate_reconstructions:
@@ -289,7 +314,7 @@ class DeterministicHelmholtz(nn.Module):
                     self.intermediate_reconstructions[self.layer_names[i]].append(-1)
                     continue
 
-                upper_h = self.inference.state_dict[self.layer_names[i + 1]].detach()
+                upper_h = self.inference.intermediate_state_dict[self.layer_names[i + 1]].detach()
                 # layer2 is stored unraveled, so to pass through
                 # to layer1 we need to reshape it
                 if i == 1:
@@ -369,19 +394,25 @@ class DiscriminatorFactorConv(nn.Module):
 
     def __init__(self, h1_channels, h2_channels,
                  conv_kernel, conv_stride, conv_pad, inner_channels_per_layer,
-                 with_sigmoid=False):
+                 dim_x_y, with_sigmoid=False):
         super(DiscriminatorFactorConv, self).__init__()
         self.conv_over_h1 = nn.Conv2d(h1_channels, inner_channels_per_layer,
                                       conv_kernel, conv_stride, conv_pad)
+        self.inner_channels_per_layer = inner_channels_per_layer
+        self.dim_x_y = dim_x_y
 
         # the result of the upper conv must have the same 2d size as the lower conv
         # (even though the original layer sizes will be different)
         # this is an ILP problem setting (1+2*conv_upper) = (4*padding_upper+kernel_lower)
-        # current impl. allows kernels of 4n-1: 3, 7, 11
+        # currently only allows kernels of 4n-1: 3, 7, 11, will through a shape error otherwise
         self.conv_over_h2 = nn.Conv2d(h2_channels, inner_channels_per_layer,
                                       conv_kernel, 1, int((conv_kernel + 1) / 4))
 
-        self.conv_over_hidden_state = nn.Conv2d(2 * inner_channels_per_layer, 1, 1)
+        # second convolution halves the x, y, and channel dims
+        self.conv_over_hidden_state = nn.Conv2d(2 * inner_channels_per_layer, inner_channels_per_layer,
+                                                4, 2, 1)
+
+        self.linear = nn.Linear(inner_channels_per_layer * dim_x_y ** 2, 1)
 
         self.relu = nn.LeakyReLU()
 
@@ -390,18 +421,19 @@ class DiscriminatorFactorConv(nn.Module):
     def forward(self, h1, h2):
         conved_h1 = self.conv_over_h1(h1)
         conved_h2 = self.conv_over_h2(h2)
-
         combined_inner_state = torch.cat([conved_h1, conved_h2], dim=1)
         combined_inner_state = self.relu(combined_inner_state)
 
-        twoD_out = self.conv_over_hidden_state(combined_inner_state)
+        combined_inner_state = self.conv_over_hidden_state(combined_inner_state)
+        combined_inner_state = self.relu(combined_inner_state)
 
-        bs = h1.size()[0]
+        combined_inner_state = combined_inner_state.view(-1, self.inner_channels_per_layer * self.dim_x_y ** 2)
+        oneD_out = self.linear(combined_inner_state)
 
-        # finally take the mean over spatial dimensions. Like an ensemble over discriminators in-layer
-        oneD_out = self.out_nonlinearity(twoD_out.view(bs, -1))
+        # finally, maybe, apply a sigmoid nonlinearity
+        oneD_out = self.out_nonlinearity(oneD_out)
 
-        return torch.mean(oneD_out, dim=1)
+        return oneD_out
 
 
 class Discriminator(nn.Module):
@@ -427,12 +459,16 @@ class Discriminator(nn.Module):
 
         with_sigmoid = loss_type == 'BCE'
 
-        self.discriminator_0and1 = DiscriminatorFactorFC(image_size ** 2 + 64 * (image_size // 2) ** 2,
-                                                         hidden_layer_size,
-                                                         with_sigmoid=with_sigmoid)
-        self.discriminator_1and2 = DiscriminatorFactorFC(128 * (image_size // 4) ** 2 + 64 * (image_size // 2) ** 2,
-                                                         hidden_layer_size,
-                                                         with_sigmoid=with_sigmoid)
+        self.discriminator_0and1 = DiscriminatorFactorConv(1, 64,
+                                                           3, 2, 1,
+                                                           dim_x_y=7,
+                                                           inner_channels_per_layer = hidden_layer_size,
+                                                           with_sigmoid = with_sigmoid)
+        self.discriminator_1and2 = DiscriminatorFactorConv(64, 128,
+                                                           3, 2, 1,
+                                                           dim_x_y=3,
+                                                           inner_channels_per_layer = hidden_layer_size,
+                                                           with_sigmoid = with_sigmoid)
         self.discriminator_2and3 = DiscriminatorFactorFC(128 * (image_size // 4) ** 2 + 1024,
                                                          hidden_layer_size,
                                                          with_sigmoid)
@@ -444,8 +480,7 @@ class Discriminator(nn.Module):
                    self.discriminator_2and3, self.discriminator_3and4]
 
         self.log_intermediate_Ds = log_intermediate_Ds
-        if log_intermediate_Ds:
-            self.intermediate_Ds = {layer: [] for layer in self.layer_names}
+        self.intermediate_Ds = {layer: [] for layer in self.layer_names}
 
         self.which_layers = 'all'
         self.no_backprop_through_full_cortex = no_backprop_through_full_cortex
@@ -468,8 +503,10 @@ class Discriminator(nn.Module):
             h1 = network_state_dict[self.layer_names[i]]
             h2 = network_state_dict[self.layer_names[i + 1]]
 
-            h2 = h2.view(h2.size()[0], -1)
-            h1 = h1.view(h1.size()[0], -1)
+            # layer2 is stored as FC, so to compare to layer1 we need to reshape it
+            if i==1:
+                h2 = h2.view(-1, 128, self.image_size//4, self.image_size//4 )
+            # h1 = h1.view(h1.size()[0], -1)
 
             if self.no_backprop_through_full_cortex:
                 if inference_or_generation == 'inference':
@@ -500,11 +537,18 @@ class Discriminator(nn.Module):
             h1g = generator_state_dict[self.layer_names[i]].detach()
             h2g = generator_state_dict[self.layer_names[i + 1]].detach()
 
-            h2g = h2g.view(h2g.size()[0], -1)
-            h1g = h1g.view(h1g.size()[0], -1)
 
-            h2i = h2i.view(h2i.size()[0], -1)
-            h1i = h1i.view(h1i.size()[0], -1)
+
+            # h2g = h2g.view(h2g.size()[0], -1)
+            # h1g = h1g.view(h1g.size()[0], -1)
+            #
+            # h2i = h2i.view(h2i.size()[0], -1)
+            # h1i = h1i.view(h1i.size()[0], -1)
+
+            # layer2 is stored as FC, so to compare to layer1 we need to reshape it
+            if i==1:
+                h2i = h2i.view(-1, 128, self.image_size//4, self.image_size//4 )
+                h2g = h2g.view(-1, 128, self.image_size//4, self.image_size//4 )
 
             gp = gp + calc_gradient_penalty(D, (h1i, h2i), (h1g, h2g), LAMBDA=self.lambda_)
 
@@ -530,6 +574,36 @@ def alpha_interpolate(tensor1, tensor2):
 
     return interpolated
 
+def alpha_spherical_interpolate(tensor1, tensor2):
+    "Returns a tensor interpolated between these two tensors, with some random about per example in the batch."
+    size = tensor1.size()
+    alpha = torch.rand(size[0], 1).to(tensor1.device)
+
+    #make 2d for interpolation
+    tensor1 = tensor1.view(size[0],-1)
+    tensor2 = tensor2.view(size[0],-1)
+
+    interpolated = slerp(alpha, tensor2, tensor1)
+
+    return interpolated.view(size)
+
+def batchdot(A, B):
+    return (A*B).sum(-1)
+
+def slerp(interp, low, high):
+    """Code lifted, torched, and batched from https://github.com/soumith/dcgan.torch/issues/14"""
+
+    eps = 1e-12
+    omega = torch.clamp(batchdot(low/(eps + torch.norm(low, dim=1).view(-1,1)),
+                                 high/(eps + torch.norm(high, dim=1).view(-1,1))), -1, 1)
+
+    omega = torch.acos(omega).view(-1, 1)
+    so = torch.sin(omega)
+    out = torch.where(so == 0,
+                     (1.0-interp) * low + interp * high, # LERP
+                     torch.sin((1.0-interp)*omega) / so * low + torch.sin(interp*omega) / so * high) #SLERP
+    return out
+
 
 def calc_gradient_penalty(netD, real_data_tuple, fake_data_tuple, LAMBDA=.1):
     """A general utility function modified from a WGAN-GP implementation.
@@ -538,10 +612,10 @@ def calc_gradient_penalty(netD, real_data_tuple, fake_data_tuple, LAMBDA=.1):
 
     batch_size = real_data_tuple[0].size()[0]
 
-    interpolates0 = alpha_interpolate(real_data_tuple[0], fake_data_tuple[0])
+    interpolates0 = alpha_spherical_interpolate(real_data_tuple[0], fake_data_tuple[0])
     interpolates0 = Variable(interpolates0, requires_grad=True)
 
-    interpolates1 = alpha_interpolate(real_data_tuple[1], fake_data_tuple[1])
+    interpolates1 = alpha_spherical_interpolate(real_data_tuple[1], fake_data_tuple[1])
     interpolates1 = Variable(interpolates1, requires_grad=True)
 
     disc_interpolates = netD(interpolates0, interpolates1)
@@ -555,6 +629,8 @@ def calc_gradient_penalty(netD, real_data_tuple, fake_data_tuple, LAMBDA=.1):
     gradient_penalty = ((gradients0.norm(2, dim=1) - 1) ** 2 +
                         (gradients1.norm(2, dim=1) - 1) ** 2).mean() * LAMBDA
     return gradient_penalty
+
+
 
 
 def initialize_weights(net):
