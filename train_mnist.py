@@ -59,6 +59,9 @@ parser.add_argument('--lamda', default=.1, type=float,
 parser.add_argument('--no-backprop-through-full-cortex', action='store_true',
                     help='Only backprop through the local (layerwise) discriminator to parameters in that same '
                      'layer of the cortex. For biological plausibility.')
+parser.add_argument('--only-backprop-generator', action='store_true',
+                    help='Only backprop through the local (layerwise) discriminator to parameters in that same '
+                     'layer of the cortex for the inference. For the generator we backprop all the way to the top.')
 parser.add_argument('--label-smoothing', action='store_true',
                     help='Make the discriminator be less confident by randomly switching labels with p=.1')
 parser.add_argument('--noise-sigma', default=0, type=float,
@@ -84,7 +87,7 @@ def train(args, cortex, train_loader, discriminator, train_history,
           optimizerD, optimizerG, optimizerF, epoch, ml_after_epoch=-1):
     if args.sequential_training:
         noise_layer = engage_new_layer(epoch, cortex, optimizerG, optimizerF, optimizerD, discriminator,
-                                       n_epochs_per_layer=5)
+                                       n_epochs_per_layer=25)
     else:
         noise_layer = len(cortex.generator_modules)
 
@@ -191,16 +194,21 @@ def main(args):
 
     mnist_size = (1, 28, 28)
 
+    # False if no bp thru cortex, or if only bp gen, else true
+    bp_thru_inf = (not args.no_backprop_through_full_cortex) and (not args.only_backprop_generator)
+    bp_thru_gen = (not args.no_backprop_through_full_cortex)
+
     cortex = DeterministicHelmholtz(image_size=mnist_size, noise_dim=args.noise_dim, surprisal_sigma=args.surprisal_sigma,
                                     log_intermediate_surprisals=args.detailed_logging,
                                     log_intermediate_reconstructions=args.detailed_logging,
                                     log_weight_alignment=args.detailed_logging,
-                                    noise_sigma = args.noise_sigma).cuda(args.gpu)
+                                    noise_sigma = args.noise_sigma,
+                                    backprop_to_start_inf=bp_thru_inf,
+                                    backprop_to_start_gen=bp_thru_gen).cuda(args.gpu)
 
     discriminator = Discriminator(args.disc_hidden_dim, cortex.layer_names, lambda_=args.lamda, loss_type=args.loss_type,
                                   noise_dim=args.noise_dim,
                                   image_size=mnist_size[1],
-                                  no_backprop_through_full_cortex = args.no_backprop_through_full_cortex,
                                   log_intermediate_Ds=args.detailed_logging).cuda(args.gpu)
 
     kwargs = {'num_workers': args.workers, 'pin_memory': True}

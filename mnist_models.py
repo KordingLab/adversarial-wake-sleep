@@ -3,39 +3,42 @@ import torch.nn as nn
 from torch.autograd import grad, Variable
 from torch.distributions import Laplace, Normal
 
+from collections import OrderedDict
+
 
 class Generator(nn.Module):
     # Network Architecture is exactly same as in infoGAN (https://arxiv.org/abs/1606.03657)
     # Architecture : FC1024_BR-FC7x7x128_BR-(64)4dc2s_BR-(1)4dc2s_S
-    def __init__(self, noise_dim=100, image_dim=1, image_size=32, noise_sigma = 0):
+    def __init__(self, noise_dim=100, image_dim=1, image_size=32, noise_sigma = 0,backprop_to_start = True):
         super(Generator, self).__init__()
         self.noise_dim = noise_dim
         self.image_dim = image_dim
         self.image_size = image_size
+        self.backprop_to_start = backprop_to_start
 
         self.generative_4to3 = nn.Sequential(
             nn.Linear(self.noise_dim, 1024),
             AddNoise(noise_sigma),
             nn.BatchNorm1d(1024),
-            nn.LeakyReLU()
+            nn.ReLU()
         )
 
         self.generative_3to2 = nn.Sequential(
             nn.Linear(1024, 128 * (self.image_size // 4) * (self.image_size // 4)),
             AddNoise(noise_sigma),
             nn.BatchNorm1d(128 * (self.image_size // 4) * (self.image_size // 4)),
-            nn.LeakyReLU(),
+            nn.ReLU(),
         )
 
         self.generative_2to1_conv = nn.Sequential(
             nn.ConvTranspose2d(128, 64, 4, 2, 1),
             AddNoise(noise_sigma),
             nn.BatchNorm2d(64),
-            nn.LeakyReLU()
+            nn.ReLU()
         )
 
         self.generative_1to0_conv = nn.Sequential(
-            nn.ConvTranspose2d(64, self.image_dim, 4, 2, 1),
+            nn.ConvTranspose2d(64, self.image_dim, 4,2,1),
             nn.Tanh(),
         )
         initialize_weights(self)
@@ -46,26 +49,44 @@ class Generator(nn.Module):
                            'Layer3': None,
                            'Layer4': None}
 
+        # list modules bottom to top. Probably a more general way exists
+        self.listed_modules = [self.generative_1to0_conv,
+                              self.generative_2to1_conv,
+                              self.generative_3to2,
+                              self.generative_4to3]
+
+        self.intermediate_state_dict = OrderedDict([('Input', None),
+                                                    ('Layer1', None),
+                                                    ('Layer2', None),
+                                                    ('Layer3', None),
+                                                    ('Layer4', None)])
+        self.layer_names = list(self.intermediate_state_dict.keys())
+
     def get_detached_state_dict(self):
         detached_dict = {k: None if (v is None) else v.detach() for k, v in self.intermediate_state_dict.items()}
         return detached_dict
 
-    def forward(self, x):
-        self.intermediate_state_dict['Layer4'] = x
 
-        x = self.generative_4to3(x)
-        self.intermediate_state_dict['Layer3'] = x
+    def forward(self, x, from_layer = 5):
+        # iterate through layers and pass the noise downwards
+        for i, (G, layer_name) in enumerate(zip(self.listed_modules[::-1],
+                                                self.layer_names[:0:-1])):
+            # Skip the topmost n layers ?
+            if len(self.listed_modules) - i > from_layer:
+                continue
+            self.intermediate_state_dict[layer_name] = x
 
-        x = self.generative_3to2(x)
-        self.intermediate_state_dict['Layer2'] = x
-        # ^ layer 2 saved as FC
+            if layer_name == "Layer2":
+                x = x.view(-1, 128, (self.image_size // 4), (self.image_size // 4))
 
-        x = x.view(-1, 128, (self.image_size // 4), (self.image_size // 4))
-        x = self.generative_2to1_conv(x)
-        self.intermediate_state_dict['Layer1'] = x
+            # this setting makes all gradient flow only go one layer back
+            if not self.backprop_to_start:
+                x = x.detach()
 
-        x = self.generative_1to0_conv(x)
-        self.intermediate_state_dict['Input'] = x
+            x = G(x)
+
+
+        self.intermediate_state_dict["Input"] = x
 
         return x
 
@@ -88,11 +109,12 @@ class AddNoise(nn.Module):
 class Inference(nn.Module):
     """ Inverse architecture of the generative model"""
 
-    def __init__(self, noise_dim=100, image_dim=1, image_size=32, noise_sigma = 0):
+    def __init__(self, noise_dim=100, image_dim=1, image_size=32, noise_sigma = 0, backprop_to_start = True):
         super(Inference, self).__init__()
         self.noise_dim = noise_dim
         self.image_dim = image_dim
         self.image_size = image_size
+        self.backprop_to_start = backprop_to_start
 
         self.inference_3to4 = nn.Sequential(
             nn.Linear(1024, self.noise_dim),
@@ -103,50 +125,56 @@ class Inference(nn.Module):
             nn.Linear(128 * (self.image_size // 4) * (self.image_size // 4), 1024),
             nn.BatchNorm1d(1024),
             AddNoise(noise_sigma),
-            nn.LeakyReLU(),
+            nn.ReLU(),
         )
 
         self.inference_1to2_conv = nn.Sequential(
             nn.Conv2d(64, 128, 4, 2, 1),
             AddNoise(noise_sigma),
             nn.BatchNorm2d(128),
-            nn.LeakyReLU()
+            nn.ReLU()
         )
 
         self.inference_0to1_conv = nn.Sequential(
-            nn.Conv2d(self.image_dim, 64, 4, 2, 1),
+            nn.Conv2d(self.image_dim, 64, 4,2,1),
             AddNoise(noise_sigma),
             nn.BatchNorm2d(64),
-            nn.LeakyReLU()
+            nn.ReLU()
         )
         initialize_weights(self)
 
-        self.intermediate_state_dict = {'Input': None,
-                           'Layer1': None,
-                           'Layer2': None,
-                           'Layer3': None,
-                           'Layer4': None}
+        # list modules bottom to top. Probably a more general way exists
+        self.listed_modules = [self.inference_0to1_conv,
+                               self.inference_1to2_conv,
+                               self.inference_2to3,
+                               self.inference_3to4]
+
+        self.intermediate_state_dict = OrderedDict([('Input', None),
+                                                    ('Layer1', None),
+                                                    ('Layer2', None),
+                                                    ('Layer3', None),
+                                                    ('Layer4', None)])
+        self.layer_names = list(self.intermediate_state_dict.keys())
 
     def get_detached_state_dict(self):
         detached_dict = {k: None if (v is None) else v.detach() for k, v in self.intermediate_state_dict.items()}
         return detached_dict
 
-    def forward(self, input):
-        self.intermediate_state_dict['Input'] = input
+    def forward(self, x):
+        self.intermediate_state_dict['Input'] = x
+        # iterate through layers and pass the input upwards
+        for F, layer_name in zip(self.listed_modules,
+                                 self.layer_names[1:]):
+            # this setting makes all gradient flow only go one layer back
+            if not self.backprop_to_start:
+                x = x.detach()
 
-        x = self.inference_0to1_conv(input)
-        self.intermediate_state_dict['Layer1'] = x
+            x = F(x)
 
-        x = self.inference_1to2_conv(x)
-        x = x.view(-1, 128 * (self.image_size // 4) * (self.image_size // 4))
-        self.intermediate_state_dict['Layer2'] = x
-        # ^ layer 2 saved as FC
+            if layer_name == "Layer2":
+                x = x.view(-1, 128 * (self.image_size // 4) * (self.image_size // 4))
 
-        x = self.inference_2to3(x)
-        self.intermediate_state_dict['Layer3'] = x
-
-        x = self.inference_3to4(x)
-        self.intermediate_state_dict['Layer4'] = x
+            self.intermediate_state_dict[layer_name] = x
 
         return x
 
@@ -167,7 +195,9 @@ class DeterministicHelmholtz(nn.Module):
                  log_intermediate_surprisals=False,
                  log_intermediate_reconstructions=False,
                  log_weight_alignment=False,
-                 noise_sigma = 0):
+                 noise_sigma = 0,
+                 backprop_to_start_inf=True,
+                 backprop_to_start_gen=True):
         super(DeterministicHelmholtz, self).__init__()
 
         if len(image_size) == 4:
@@ -181,19 +211,12 @@ class DeterministicHelmholtz(nn.Module):
         else:
             raise NotImplementedError("Image sizes are wrong.")
 
-        self.inference = Inference(noise_dim, image_dim, image_edge_size, noise_sigma)
-        self.generator = Generator(noise_dim, image_dim, image_edge_size, noise_sigma)
 
-        # list modules bottom to top. Probably a more general way
-        self.generator_modules = [self.generator.generative_1to0_conv,
-                                  self.generator.generative_2to1_conv,
-                                  self.generator.generative_3to2,
-                                  self.generator.generative_4to3]
+        self.inference = Inference(noise_dim, image_dim, image_edge_size, noise_sigma, backprop_to_start_inf)
+        self.generator = Generator(noise_dim, image_dim, image_edge_size, noise_sigma, backprop_to_start_gen)
 
-        self.inference_modules = [self.inference.inference_0to1_conv,
-                                  self.inference.inference_1to2_conv,
-                                  self.inference.inference_2to3,
-                                  self.inference.inference_3to4]
+        self.generator_modules = self.generator.listed_modules
+        self.inference_modules = self.inference.listed_modules
 
         self.noise_dist = Normal(torch.tensor([0.0]), torch.tensor([1.0]))
         self.mse = nn.MSELoss()
@@ -238,30 +261,7 @@ class DeterministicHelmholtz(nn.Module):
             self.inference.intermediate_state_dict[noise_layer_str].device)
         x = x.squeeze(dim=-1)
         # x = torch.abs(x)
-
-        if noise_layer > 3:
-            self.generator.intermediate_state_dict['Layer4'] = x
-
-            x = self.generator.generative_4to3(x)
-
-        if noise_layer > 2:
-            self.generator.intermediate_state_dict['Layer3'] = x
-            x = self.generator.generative_3to2(x)
-
-        if noise_layer > 1:
-            self.generator.intermediate_state_dict['Layer2'] = x
-            # ^ layer 2 saved as FC
-
-            x = x.view(-1, 128, (self.image_size // 4), (self.image_size // 4))
-            x = self.generator.generative_2to1_conv(x)
-        if noise_layer > 0:
-            self.generator.intermediate_state_dict['Layer1'] = x
-
-            x = self.generator.generative_1to0_conv(x)
-            self.generator.intermediate_state_dict['Input'] = x
-        else:
-            raise AssertionError("Noising the input layer? that doesn't make that much sense.")
-
+        x = self.generator(x, from_layer = noise_layer)
         return x
 
     def generator_surprisal(self):
@@ -332,7 +332,7 @@ class DeterministicHelmholtz(nn.Module):
                 gen_weight = list(G.parameters())[0]
                 inf_weight = list(F.parameters())[0]
 
-                cosine = torch.nn.CosineSimilarity()(inf_weight.transpose(1, 0).cpu().view(1, -1),
+                cosine = torch.nn.CosineSimilarity()(inf_weight.cpu().view(1, -1),
                                                      gen_weight.cpu().view(1, -1))
                 angle = torch.acos(cosine).item()
                 self.weight_alignment[self.layer_names[i]].append(angle)
@@ -397,8 +397,11 @@ class DiscriminatorFactorConv(nn.Module):
                  dim_x_y, with_sigmoid=False):
         super(DiscriminatorFactorConv, self).__init__()
         self.conv_over_h1 = nn.Conv2d(h1_channels, inner_channels_per_layer,
-                                      conv_kernel, conv_stride, conv_pad)
+                                      conv_kernel, conv_stride, conv_pad,
+                                      bias = False)
+
         self.inner_channels_per_layer = inner_channels_per_layer
+        dim_x_y = dim_x_y // 4
         self.dim_x_y = dim_x_y
 
         # the result of the upper conv must have the same 2d size as the lower conv
@@ -406,7 +409,7 @@ class DiscriminatorFactorConv(nn.Module):
         # this is an ILP problem setting (1+2*conv_upper) = (4*padding_upper+kernel_lower)
         # currently only allows kernels of 4n-1: 3, 7, 11, will through a shape error otherwise
         self.conv_over_h2 = nn.Conv2d(h2_channels, inner_channels_per_layer,
-                                      conv_kernel, 1, int((conv_kernel + 1) / 4))
+                                      conv_kernel-1, 1, int((conv_kernel) / 4), bias = False)
 
         # second convolution halves the x, y, and channel dims
         self.conv_over_hidden_state = nn.Conv2d(2 * inner_channels_per_layer, inner_channels_per_layer,
@@ -414,7 +417,7 @@ class DiscriminatorFactorConv(nn.Module):
 
         self.linear = nn.Linear(inner_channels_per_layer * dim_x_y ** 2, 1)
 
-        self.relu = nn.LeakyReLU()
+        self.relu = nn.LeakyReLU(.2, inplace = True)
 
         self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null
 
@@ -427,13 +430,78 @@ class DiscriminatorFactorConv(nn.Module):
         combined_inner_state = self.conv_over_hidden_state(combined_inner_state)
         combined_inner_state = self.relu(combined_inner_state)
 
-        combined_inner_state = combined_inner_state.view(-1, self.inner_channels_per_layer * self.dim_x_y ** 2)
+        combined_inner_state = combined_inner_state.view(h1.size()[0], -1)
+
         oneD_out = self.linear(combined_inner_state)
 
         # finally, maybe, apply a sigmoid nonlinearity
         oneD_out = self.out_nonlinearity(oneD_out)
 
         return oneD_out
+
+
+
+class DiscriminatorFactorConv_nolinear(nn.Module):
+    """To discriminate between two layers separated by a convolutional operation.
+
+    The insight here is we only need to discriminate between those pairs of a lower and higher layer that,
+    under the Conv2d or ConvTranpose2d, would map to one another.
+
+    So we convolve over and look at those, expand them into a large inner_channel, and then collapse.
+    (The collapsing is a convolved linear layer, i.e. Conv1d)
+    The output is then the mean of all of the 'discriminators' represented by each step of the conv.
+
+    [conv_kernel, conv_stride, conv_pad] = the parameters of the Conv2d in the inference operation between
+    the two layers (or equivalently the ConvTranspose2d of the generator)
+
+    inner_channels_per_layer: how many hidden dimension channel to allocate to each layer.
+
+    with_sigmoid = Boolean. Whether to apply a sigmoid to the output of each inner Discriminator, as required when
+                        averaging (ensembling) multiple discriminators in a standard GAN with BCELoss"""
+
+    def __init__(self, h1_channels, h2_channels,
+                 conv_kernel, conv_stride, conv_pad, inner_channels_per_layer,
+                 dim_x_y, with_sigmoid=False):
+        super(DiscriminatorFactorConv, self).__init__()
+        self.conv_over_h1 = nn.Conv2d(h1_channels, inner_channels_per_layer,
+                                      conv_kernel, conv_stride, conv_pad,
+                                      bias = False)
+
+        self.inner_channels_per_layer = inner_channels_per_layer
+        dim_x_y = dim_x_y // 4
+        self.dim_x_y = dim_x_y
+
+        # the result of the upper conv must have the same 2d size as the lower conv
+        # (even though the original layer sizes will be different)
+        # this is an ILP problem setting (1+2*conv_upper) = (4*padding_upper+kernel_lower)
+        # currently only allows kernels of 4n-1: 3, 7, 11, will through a shape error otherwise
+        self.conv_over_h2 = nn.Conv2d(h2_channels, inner_channels_per_layer,
+                                      conv_kernel-1, 1, int((conv_kernel) / 4), bias = False)
+
+        # second convolution halves the x, y, and channel dims
+        self.conv_over_hidden_state = nn.Conv2d(2 * inner_channels_per_layer, 1,
+                                                1, 1, 0)
+
+        self.linear = nn.Linear(inner_channels_per_layer * dim_x_y ** 2, 1)
+
+        self.relu = nn.LeakyReLU(.2, inplace = True)
+
+        self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null
+
+    def forward(self, h1, h2):
+        conved_h1 = self.conv_over_h1(h1)
+        conved_h2 = self.conv_over_h2(h2)
+        combined_inner_state = torch.cat([conved_h1, conved_h2], dim=1)
+        combined_inner_state = self.relu(combined_inner_state)
+
+        combined_inner_state = self.conv_over_hidden_state(combined_inner_state)
+
+        oneD_out = combined_inner_state.view(h1.size()[0], -1)
+
+        # finally, maybe, apply a sigmoid nonlinearity
+        oneD_out = self.out_nonlinearity(oneD_out)
+
+        return oneD_out.mean(dim=1)
 
 
 class Discriminator(nn.Module):
@@ -460,13 +528,13 @@ class Discriminator(nn.Module):
         with_sigmoid = loss_type == 'BCE'
 
         self.discriminator_0and1 = DiscriminatorFactorConv(1, 64,
-                                                           3, 2, 1,
-                                                           dim_x_y=7,
+                                                           4,2,1,
+                                                           dim_x_y=image_size,
                                                            inner_channels_per_layer = hidden_layer_size,
                                                            with_sigmoid = with_sigmoid)
         self.discriminator_1and2 = DiscriminatorFactorConv(64, 128,
-                                                           3, 2, 1,
-                                                           dim_x_y=3,
+                                                           4, 2, 1,
+                                                           dim_x_y=image_size//2,
                                                            inner_channels_per_layer = hidden_layer_size,
                                                            with_sigmoid = with_sigmoid)
         self.discriminator_2and3 = DiscriminatorFactorFC(128 * (image_size // 4) ** 2 + 1024,
