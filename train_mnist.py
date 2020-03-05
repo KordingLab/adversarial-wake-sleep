@@ -54,6 +54,8 @@ parser.add_argument('--surprisal-sigma', default=1, type=float,
              ' Equivalent to minimizing the reconstruction error from inference states, up one layer, and back down.')
 parser.add_argument('--minimize-generator-surprisal', action='store_true',
                     help='Minimize generator surprisal using value of sigma set.')
+parser.add_argument('--minimize-inference-surprisal', action='store_true',
+                    help='Minimize generator surprisal using value of sigma set.')
 parser.add_argument('--lamda', default=.1, type=float,
                     help='Lambda for the gradient penalty in the WGAN formulation. Only for Wasserstein loss.')
 parser.add_argument('--no-backprop-through-full-cortex', action='store_true',
@@ -66,7 +68,10 @@ parser.add_argument('--label-smoothing', action='store_true',
                     help='Make the discriminator be less confident by randomly switching labels with p=.1')
 parser.add_argument('--noise-sigma', default=0, type=float,
                     help='If set, add Gaussian noise with this variance to the pre-Relu activations of both passes.')
-
+parser.add_argument('--normalize', action='store_true',
+                    help='Divisive normalization')
+parser.add_argument('--update-ratio', default=1, type=float,
+                    help='Number of discriminator updates per generator update')
 
 
 # printing and saving
@@ -87,7 +92,7 @@ def train(args, cortex, train_loader, discriminator, train_history,
           optimizerD, optimizerG, optimizerF, epoch, ml_after_epoch=-1):
     if args.sequential_training:
         noise_layer = engage_new_layer(epoch, cortex, optimizerG, optimizerF, optimizerD, discriminator,
-                                       n_epochs_per_layer=25)
+                                     n_epochs_per_layer=25)
     else:
         noise_layer = len(cortex.generator_modules)
 
@@ -113,10 +118,10 @@ def train(args, cortex, train_loader, discriminator, train_history,
         # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
         # with Gaussian we have log p  = MSE between actual and predicted
         ML_loss = cortex.generator_surprisal()
-        if epoch > ml_after_epoch:
+        if args.minimize_generator_surprisal:
             ML_loss.backward()
-            optimizerG.step()
-            optimizerG.zero_grad()
+            # optimizerG.step()
+            # optimizerG.zero_grad()
 
         # We could update the discriminator here too, if we want.
         # For efficiency I'm putting it later (in the 'sleep') section
@@ -126,6 +131,12 @@ def train(args, cortex, train_loader, discriminator, train_history,
         # fantasize
 
         generated_input = cortex.noise_and_generate(noise_layer)
+
+        if args.minimize_inference_surprisal:
+            ML_loss = cortex.inference_surprisal()
+            ML_loss.backward()
+            # optimizerF.step()
+            # optimizerF.zero_grad()
 
         if args.label_smoothing:
             #with prob .1 we switch the labels
@@ -158,22 +169,23 @@ def train(args, cortex, train_loader, discriminator, train_history,
                         nn.BCELoss()(d_gen, (1-p) * Variable(torch.ones(batch_size, 1).to(real_samples.device)))
 
         # now update the inference and generator to fight the discriminator
-
-        if args.loss_type == 'hinge' or args.loss_type == 'wasserstein':
-            gen_loss = -discriminator(cortex.generator.intermediate_state_dict).mean() + \
-                       discriminator(cortex.inference.intermediate_state_dict).mean()
-        else:
-            gen_loss = nn.BCELoss()(discriminator(cortex.generator.intermediate_state_dict),
-                                    Variable(torch.ones(batch_size, 1).cuda(args.gpu))) + \
-                       nn.BCELoss()(discriminator(cortex.inference.intermediate_state_dict),
-                                    Variable(torch.zeros(batch_size, 1).cuda(args.gpu)))
+        if batch % args.update_ratio == 0:
+            if args.loss_type == 'hinge' or args.loss_type == 'wasserstein':
+                gen_loss = -discriminator(cortex.generator.intermediate_state_dict).mean() + \
+                           discriminator(cortex.inference.intermediate_state_dict).mean()
+            else:
+                gen_loss = nn.BCELoss()(discriminator(cortex.generator.intermediate_state_dict),
+                                        Variable(torch.ones(batch_size, 1).cuda(args.gpu))) + \
+                           nn.BCELoss()(discriminator(cortex.inference.intermediate_state_dict),
+                                        Variable(torch.zeros(batch_size, 1).cuda(args.gpu)))
 
         disc_loss.backward()
         optimizerD.step()
 
-        gen_loss.backward()
-        optimizerG.step()
-        optimizerF.step()
+        if batch % args.update_ratio == 0:
+            gen_loss.backward()
+            optimizerG.step()
+            optimizerF.step()
 
         if batch % 47 == 0:
             # get reconstruction loss to measure F
@@ -204,7 +216,8 @@ def main(args):
                                     log_weight_alignment=args.detailed_logging,
                                     noise_sigma = args.noise_sigma,
                                     backprop_to_start_inf=bp_thru_inf,
-                                    backprop_to_start_gen=bp_thru_gen).cuda(args.gpu)
+                                    backprop_to_start_gen=bp_thru_gen,
+                                    normalize=args.normalize).cuda(args.gpu)
 
     discriminator = Discriminator(cortex.layer_names, lambda_=args.lamda, loss_type=args.loss_type,
                                   noise_dim=args.noise_dim,

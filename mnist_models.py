@@ -9,12 +9,25 @@ from collections import OrderedDict
 class Generator(nn.Module):
     # Network Architecture is exactly same as in infoGAN (https://arxiv.org/abs/1606.03657)
     # Architecture : FC1024_BR-FC7x7x128_BR-(64)4dc2s_BR-(1)4dc2s_S
-    def __init__(self, noise_dim=100, image_dim=1, image_size=32, noise_sigma = 0,backprop_to_start = True):
+    def __init__(self, noise_dim=100, image_dim=1, image_size=32, noise_sigma = 0,
+                 backprop_to_start = False, normalize = True):
+        """
+
+
+
+        :param noise_dim:
+        :param image_dim:
+        :param image_size:
+        :param noise_sigma: inject Gaussian noise with this sigma to all activations.
+        :param normalization: (bool) normalize the input latent vector
+        :param backprop_to_start: If True, do not backprop through this network; detaches in state dict.
+        """
         super(Generator, self).__init__()
         self.noise_dim = noise_dim
         self.image_dim = image_dim
         self.image_size = image_size
-        backprop_to_start = True
+        print("Gen backprop :", backprop_to_start)
+
         self.backprop_to_start = backprop_to_start
 
         self.generative_4to3 = nn.Sequential(
@@ -63,6 +76,11 @@ class Generator(nn.Module):
                                                     ('Layer4', None)])
         self.layer_names = list(self.intermediate_state_dict.keys())
 
+        # normalization
+        self.normalizationLayer = None
+        if normalize:
+            self.normalizationLayer = NormalizationLayer()
+
     def get_detached_state_dict(self):
         detached_dict = {k: None if (v is None) else v.detach() for k, v in self.intermediate_state_dict.items()}
         return detached_dict
@@ -79,6 +97,9 @@ class Generator(nn.Module):
 
             if layer_name == "Layer2":
                 x = x.view(-1, 128, (self.image_size // 4), (self.image_size // 4))
+                #supposed to normalize over channels, not pixels
+                if self.normalizationLayer is not None:
+                    x = self.normalizationLayer(x)
 
             # this setting makes all gradient flow only go one layer back
             if not self.backprop_to_start:
@@ -86,6 +107,10 @@ class Generator(nn.Module):
 
             x = G(x)
 
+            ## Normalize the conv layers?
+            if (layer_name == "Layer1") or (layer_name == "Input"):
+                if self.normalizationLayer is not None:
+                    x = self.normalizationLayer(x)
 
         self.intermediate_state_dict["Input"] = x
 
@@ -110,12 +135,13 @@ class AddNoise(nn.Module):
 class Inference(nn.Module):
     """ Inverse architecture of the generative model"""
 
-    def __init__(self, noise_dim=100, image_dim=1, image_size=32, noise_sigma = 0, backprop_to_start = True):
+    def __init__(self, noise_dim=100, image_dim=1, image_size=32, noise_sigma = 0, backprop_to_start = True,
+                 normalize = True):
         super(Inference, self).__init__()
         self.noise_dim = noise_dim
         self.image_dim = image_dim
         self.image_size = image_size
-        backprop_to_start = True
+        print("Inf backprop :", backprop_to_start)
         self.backprop_to_start = backprop_to_start
 
         self.inference_3to4 = nn.Sequential(
@@ -158,20 +184,34 @@ class Inference(nn.Module):
                                                     ('Layer4', None)])
         self.layer_names = list(self.intermediate_state_dict.keys())
 
+        # normalization
+        self.normalizationLayer = None
+        if normalize:
+            self.normalizationLayer = NormalizationLayer()
+
     def get_detached_state_dict(self):
         detached_dict = {k: None if (v is None) else v.detach() for k, v in self.intermediate_state_dict.items()}
         return detached_dict
 
     def forward(self, x):
+        ## Normalize the input ?
+        if self.normalizationLayer is not None:
+            x = self.normalizationLayer(x)
+
         self.intermediate_state_dict['Input'] = x
         # iterate through layers and pass the input upwards
-        for F, layer_name in zip(self.listed_modules,
-                                 self.layer_names[1:]):
+        for i, (F, layer_name) in enumerate(zip(self.listed_modules,
+                                            self.layer_names[1:])):
             # this setting makes all gradient flow only go one layer back
             if not self.backprop_to_start:
                 x = x.detach()
 
             x = F(x)
+
+            ## Normalize the output of conv layers?
+            if i > 2:
+                if self.normalizationLayer is not None:
+                    x = self.normalizationLayer(x)
 
             if layer_name == "Layer2":
                 x = x.view(-1, 128 * (self.image_size // 4) * (self.image_size // 4))
@@ -199,7 +239,8 @@ class DeterministicHelmholtz(nn.Module):
                  log_weight_alignment=False,
                  noise_sigma = 0,
                  backprop_to_start_inf=True,
-                 backprop_to_start_gen=True):
+                 backprop_to_start_gen=True,
+                 normalize = True):
         super(DeterministicHelmholtz, self).__init__()
 
         if len(image_size) == 4:
@@ -214,8 +255,10 @@ class DeterministicHelmholtz(nn.Module):
             raise NotImplementedError("Image sizes are wrong.")
 
 
-        self.inference = Inference(noise_dim, image_dim, image_edge_size, noise_sigma, backprop_to_start_inf)
-        self.generator = Generator(noise_dim, image_dim, image_edge_size, noise_sigma, backprop_to_start_gen)
+        self.inference = Inference(noise_dim, image_dim, image_edge_size, noise_sigma, backprop_to_start_inf,
+                                            normalize = normalize)
+        self.generator = Generator(noise_dim, image_dim, image_edge_size, noise_sigma, backprop_to_start_gen,
+                                            normalize = normalize)
 
         self.generator_modules = self.generator.listed_modules
         self.inference_modules = self.inference.listed_modules
@@ -268,6 +311,7 @@ class DeterministicHelmholtz(nn.Module):
 
     def generator_surprisal(self):
         """Given the current inference state, ascertain how surprised the generator model was.
+        Equivalent to minimizing the reconstruction error (i->i+1->i) during inference.
 
         """
         # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
@@ -291,6 +335,42 @@ class DeterministicHelmholtz(nn.Module):
                 upper_h = upper_h.view(-1, 128, self.image_size // 4, self.image_size // 4)
 
             layerwise_surprisal = self.mse(G(upper_h), lower_h)
+            if i in self.which_layers:
+                ML_loss = ML_loss + layerwise_surprisal
+
+            if self.log_intermediate_surprisals:
+                self.intermediate_surprisals[self.layer_names[i]].append(layerwise_surprisal.item())
+
+        ML_loss = ML_loss / self.surprisal_sigma
+
+        return ML_loss  # / float(len(self.generator_modules))
+
+    def inference_surprisal(self):
+        """Given the current inference state, ascertain how surprised the generator model was.
+        Equivalent to minimizing the reconstruction error (i->i-1->i) during generation.
+
+        """
+        # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
+        # with Gaussian we have log p  = MSE between actual and predicted
+
+        if self.generator.intermediate_state_dict['Input'] is None:
+            raise AssertionError("Inference must be run first before calculating this.")
+
+        ML_loss = 0
+
+        for i, F in enumerate(self.inference_modules):
+            if i not in self.which_layers:
+                continue
+
+            lower_h = self.generator.intermediate_state_dict[self.layer_names[i]].detach()
+            upper_h = self.generator.intermediate_state_dict[self.layer_names[i + 1]].detach()
+
+            # layer2 is stored unraveled, so to compare we need to reshape the output
+            F_upper_h = F(lower_h)
+            if self.layer_names[i] == "Layer1":
+                F_upper_h = F_upper_h.view(-1, 128 * self.image_size // 4 * self.image_size // 4)
+
+            layerwise_surprisal = self.mse(upper_h, F_upper_h)
             if i in self.which_layers:
                 ML_loss = ML_loss + layerwise_surprisal
 
@@ -533,3 +613,112 @@ def initialize_weights(net):
         elif isinstance(m, nn.Linear):
             m.weight.data.normal_(0, 0.02)
             m.bias.data.zero_()
+
+
+class NormalizationLayer(nn.Module):
+
+    def __init__(self):
+        super(NormalizationLayer, self).__init__()
+
+    def forward(self, x, epsilon=1e-8):
+        return x * (((x**2).mean(dim=1, keepdim=True) + epsilon).rsqrt())
+
+def getLayerNormalizationFactor(x):
+    r"""
+    Get He's constant for the given layer
+    https://www.cv-foundation.org/openaccess/content_iccv_2015/papers/He_Delving_Deep_into_ICCV_2015_paper.pdf
+    """
+    size = x.weight.size()
+    fan_in = prod(size[1:])
+
+    return math.sqrt(2.0 / fan_in)
+
+
+class ConstrainedLayer(nn.Module):
+    r"""
+    A handy refactor that allows the user to:
+    - initialize one layer's bias to zero
+    - apply He's initialization at runtime
+    """
+
+    def __init__(self,
+                 module,
+                 equalized=True,
+                 lrMul=1.0,
+                 initBiasToZero=True):
+        r"""
+        equalized (bool): if true, the layer's weight should evolve within
+                         the range (-1, 1)
+        initBiasToZero (bool): if true, bias will be initialized to zero
+        """
+
+        super(ConstrainedLayer, self).__init__()
+
+        self.module = module
+        self.equalized = equalized
+
+        if initBiasToZero:
+            self.module.bias.data.fill_(0)
+        if self.equalized:
+            self.module.weight.data.normal_(0, 1)
+            self.module.weight.data /= lrMul
+            self.weight = getLayerNormalizationFactor(self.module) * lrMul
+
+    def forward(self, x):
+
+        x = self.module(x)
+        if self.equalized:
+            x *= self.weight
+        return x
+
+
+class EqualizedConv2d(ConstrainedLayer):
+
+    def __init__(self,
+                 nChannelsPrevious,
+                 nChannels,
+                 kernelSize,
+                 padding=0,
+                 bias=True,
+                 **kwargs):
+        r"""
+        A nn.Conv2d module with specific constraints
+        Args:
+            nChannelsPrevious (int): number of channels in the previous layer
+            nChannels (int): number of channels of the current layer
+            kernelSize (int): size of the convolutional kernel
+            padding (int): convolution's padding
+            bias (bool): with bias ?
+        """
+
+        ConstrainedLayer.__init__(self,
+                                  nn.Conv2d(nChannelsPrevious, nChannels,
+                                            kernelSize, padding=padding,
+                                            bias=bias),
+                                  **kwargs)
+
+def num_flat_features(x):
+    size = x.size()[1:]  # all dimensions except the batch dimension
+    num_features = 1
+    for s in size:
+        num_features *= s
+    return num_features
+
+class EqualizedLinear(ConstrainedLayer):
+
+    def __init__(self,
+                 nChannelsPrevious,
+                 nChannels,
+                 bias=True,
+                 **kwargs):
+        r"""
+        A nn.Linear module with specific constraints
+        Args:
+            nChannelsPrevious (int): number of channels in the previous layer
+            nChannels (int): number of channels of the current layer
+            bias (bool): with bias ?
+        """
+
+        ConstrainedLayer.__init__(self,
+                                  nn.Linear(nChannelsPrevious, nChannels,
+                                  bias=bias), **kwargs)
