@@ -354,7 +354,7 @@ class DeterministicHelmholtz(nn.Module):
         # with Gaussian we have log p  = MSE between actual and predicted
 
         if self.generator.intermediate_state_dict['Input'] is None:
-            raise AssertionError("Inference must be run first before calculating this.")
+            raise AssertionError("Generation must be run first before calculating this.")
 
         ML_loss = 0
 
@@ -373,9 +373,6 @@ class DeterministicHelmholtz(nn.Module):
             layerwise_surprisal = self.mse(upper_h, F_upper_h)
             if i in self.which_layers:
                 ML_loss = ML_loss + layerwise_surprisal
-
-            if self.log_intermediate_surprisals:
-                self.intermediate_surprisals[self.layer_names[i]].append(layerwise_surprisal.item())
 
         ML_loss = ML_loss / self.surprisal_sigma
 
@@ -492,7 +489,7 @@ class Discriminator(nn.Module):
         self.discriminator_1= DiscriminatorFactorConv(64,
                                                        4, 2, 1,
                                                        with_sigmoid = with_sigmoid)
-        self.discriminator_2= DiscriminatorFactor(128*7*7,
+        self.discriminator_2= DiscriminatorFactorConv(128,
                                                        with_sigmoid = with_sigmoid)
         self.discriminator_3 = DiscriminatorFactor(1024,
                                                          with_sigmoid)
@@ -523,6 +520,8 @@ class Discriminator(nn.Module):
                 continue
 
             h1 = network_state_dict[self.layer_names[i]]
+            if i == 2:
+                h1 = h1.view(-1,128,7,7)
 
             this_d = D(h1).view(-1, 1)
 
@@ -543,6 +542,9 @@ class Discriminator(nn.Module):
             h1i = inference_state_dict[self.layer_names[i]].detach()
 
             h1g = generator_state_dict[self.layer_names[i]].detach()
+            if i == 2:
+                h1i = h1i.view(-1,128,7,7)
+                h1g = h1g.view(-1,128,7,7)
 
             gp = gp + calc_gradient_penalty(D, h1i, h1g, LAMBDA=self.lambda_)
 
