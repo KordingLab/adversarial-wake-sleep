@@ -14,6 +14,7 @@ class Generator(nn.Module):
         self.noise_dim = noise_dim
         self.image_dim = image_dim
         self.image_size = image_size
+        backprop_to_start = True
         self.backprop_to_start = backprop_to_start
 
         self.generative_4to3 = nn.Sequential(
@@ -114,6 +115,7 @@ class Inference(nn.Module):
         self.noise_dim = noise_dim
         self.image_dim = image_dim
         self.image_size = image_size
+        backprop_to_start = True
         self.backprop_to_start = backprop_to_start
 
         self.inference_3to4 = nn.Sequential(
@@ -341,167 +343,46 @@ def null(x):
     "Pickleable nothing"
     return x
 
-class DiscriminatorFactorFC(nn.Module):
-    """To discriminate between two full-connected layers"""
+class DiscriminatorFactor(nn.Module):
+    """To discriminate between two layers"""
 
-    def __init__(self, input_size, hidden_size, with_sigmoid=False):
-        super(DiscriminatorFactorFC, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.relu = nn.LeakyReLU()
-
-        self.fc2 = nn.Linear(hidden_size, 1)
+    def __init__(self, input_size, with_sigmoid=False):
+        super(DiscriminatorFactor, self).__init__()
+        self.fc1 = nn.Linear(input_size, 1)
 
         self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null
 
-    def forward(self, h1, h2):
-
-        # make sure both inputs are 2d. We assume that one is 4d and the other 2d
-        if len(h1.size()) == 4:
-            h1 = h1.view(h2.size())
-        if len(h2.size()) == 4:
-            h2 = h2.view(h1.size())
-        if len(h1.size()) == 4:
-            raise AssertionError("Something is amiss; both input layers were 4d")
-
-        x = torch.cat([h1, h2], dim=1)
+    def forward(self, x):
 
         out = self.fc1(x)
-
-        out = self.relu(out)
-        out = self.fc2(out)
         out = self.out_nonlinearity(out)
 
         return out
 
 
 class DiscriminatorFactorConv(nn.Module):
-    """To discriminate between two layers separated by a convolutional operation.
-
-    The insight here is we only need to discriminate between those pairs of a lower and higher layer that,
-    under the Conv2d or ConvTranpose2d, would map to one another.
-
-    So we convolve over and look at those, expand them into a large inner_channel, and then collapse.
-    (The collapsing is a convolved linear layer, i.e. Conv1d)
-    The output is then the mean of all of the 'discriminators' represented by each step of the conv.
-
-    [conv_kernel, conv_stride, conv_pad] = the parameters of the Conv2d in the inference operation between
-    the two layers (or equivalently the ConvTranspose2d of the generator)
-
-    inner_channels_per_layer: how many hidden dimension channel to allocate to each layer.
+    """To discriminate between activations on a convolutional layer
 
     with_sigmoid = Boolean. Whether to apply a sigmoid to the output of each inner Discriminator, as required when
                         averaging (ensembling) multiple discriminators in a standard GAN with BCELoss"""
 
-    def __init__(self, h1_channels, h2_channels,
-                 conv_kernel, conv_stride, conv_pad, inner_channels_per_layer,
-                 dim_x_y, with_sigmoid=False):
+    def __init__(self, h1_channels,
+                 conv_kernel, conv_stride, conv_pad,
+                 with_sigmoid=False):
         super(DiscriminatorFactorConv, self).__init__()
-        self.conv_over_h1 = nn.Conv2d(h1_channels, inner_channels_per_layer,
+        self.conv_over_h1 = nn.Conv2d(h1_channels, 1,
                                       conv_kernel, conv_stride, conv_pad,
                                       bias = False)
 
-        self.inner_channels_per_layer = inner_channels_per_layer
-        dim_x_y = dim_x_y // 4
-        self.dim_x_y = dim_x_y
-
-        # the result of the upper conv must have the same 2d size as the lower conv
-        # (even though the original layer sizes will be different)
-        # this is an ILP problem setting (1+2*conv_upper) = (4*padding_upper+kernel_lower)
-        # currently only allows kernels of 4n-1: 3, 7, 11, will through a shape error otherwise
-        self.conv_over_h2 = nn.Conv2d(h2_channels, inner_channels_per_layer,
-                                      conv_kernel-1, 1, int((conv_kernel) / 4), bias = False)
-
-        # second convolution halves the x, y, and channel dims
-        self.conv_over_hidden_state = nn.Conv2d(2 * inner_channels_per_layer, inner_channels_per_layer,
-                                                4, 2, 1)
-
-        self.linear = nn.Linear(inner_channels_per_layer * dim_x_y ** 2, 1)
-
-        self.relu = nn.LeakyReLU(.2, inplace = True)
-
         self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null
 
-    def forward(self, h1, h2):
-        conved_h1 = self.conv_over_h1(h1)
-        conved_h2 = self.conv_over_h2(h2)
-        combined_inner_state = torch.cat([conved_h1, conved_h2], dim=1)
-        combined_inner_state = self.relu(combined_inner_state)
-
-        combined_inner_state = self.conv_over_hidden_state(combined_inner_state)
-        combined_inner_state = self.relu(combined_inner_state)
-
-        combined_inner_state = combined_inner_state.view(h1.size()[0], -1)
-
-        oneD_out = self.linear(combined_inner_state)
-
+    def forward(self, h1):
+        x = self.conv_over_h1(h1)
+        x = x.view(h1.size()[0],-1)
         # finally, maybe, apply a sigmoid nonlinearity
-        oneD_out = self.out_nonlinearity(oneD_out)
+        x = self.out_nonlinearity(x)
 
-        return oneD_out
-
-
-
-class DiscriminatorFactorConv_nolinear(nn.Module):
-    """To discriminate between two layers separated by a convolutional operation.
-
-    The insight here is we only need to discriminate between those pairs of a lower and higher layer that,
-    under the Conv2d or ConvTranpose2d, would map to one another.
-
-    So we convolve over and look at those, expand them into a large inner_channel, and then collapse.
-    (The collapsing is a convolved linear layer, i.e. Conv1d)
-    The output is then the mean of all of the 'discriminators' represented by each step of the conv.
-
-    [conv_kernel, conv_stride, conv_pad] = the parameters of the Conv2d in the inference operation between
-    the two layers (or equivalently the ConvTranspose2d of the generator)
-
-    inner_channels_per_layer: how many hidden dimension channel to allocate to each layer.
-
-    with_sigmoid = Boolean. Whether to apply a sigmoid to the output of each inner Discriminator, as required when
-                        averaging (ensembling) multiple discriminators in a standard GAN with BCELoss"""
-
-    def __init__(self, h1_channels, h2_channels,
-                 conv_kernel, conv_stride, conv_pad, inner_channels_per_layer,
-                 dim_x_y, with_sigmoid=False):
-        super(DiscriminatorFactorConv, self).__init__()
-        self.conv_over_h1 = nn.Conv2d(h1_channels, inner_channels_per_layer,
-                                      conv_kernel, conv_stride, conv_pad,
-                                      bias = False)
-
-        self.inner_channels_per_layer = inner_channels_per_layer
-        dim_x_y = dim_x_y // 4
-        self.dim_x_y = dim_x_y
-
-        # the result of the upper conv must have the same 2d size as the lower conv
-        # (even though the original layer sizes will be different)
-        # this is an ILP problem setting (1+2*conv_upper) = (4*padding_upper+kernel_lower)
-        # currently only allows kernels of 4n-1: 3, 7, 11, will through a shape error otherwise
-        self.conv_over_h2 = nn.Conv2d(h2_channels, inner_channels_per_layer,
-                                      conv_kernel-1, 1, int((conv_kernel) / 4), bias = False)
-
-        # second convolution halves the x, y, and channel dims
-        self.conv_over_hidden_state = nn.Conv2d(2 * inner_channels_per_layer, 1,
-                                                1, 1, 0)
-
-        self.linear = nn.Linear(inner_channels_per_layer * dim_x_y ** 2, 1)
-
-        self.relu = nn.LeakyReLU(.2, inplace = True)
-
-        self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null
-
-    def forward(self, h1, h2):
-        conved_h1 = self.conv_over_h1(h1)
-        conved_h2 = self.conv_over_h2(h2)
-        combined_inner_state = torch.cat([conved_h1, conved_h2], dim=1)
-        combined_inner_state = self.relu(combined_inner_state)
-
-        combined_inner_state = self.conv_over_hidden_state(combined_inner_state)
-
-        oneD_out = combined_inner_state.view(h1.size()[0], -1)
-
-        # finally, maybe, apply a sigmoid nonlinearity
-        oneD_out = self.out_nonlinearity(oneD_out)
-
-        return oneD_out.mean(dim=1)
+        return x.mean(dim=1)
 
 
 class Discriminator(nn.Module):
@@ -515,45 +396,38 @@ class Discriminator(nn.Module):
             lambda_: when using WGAN-GP, the size of the GP
             loss_type: a string. If `BCE`, then we apply a sigmoid to each sub-discriminator before averaging."""
 
-    def __init__(self, hidden_layer_size, layer_names, lambda_=0, loss_type='wasserstein',
+    def __init__(self, layer_names, lambda_=0, loss_type='wasserstein',
                  noise_dim=100,
-                 image_size=28, log_intermediate_Ds=False,
-                 no_backprop_through_full_cortex=False):
+                 log_intermediate_Ds=False):
         super(Discriminator, self).__init__()
 
         self.layer_names = layer_names
         self.lambda_ = lambda_
-        self.image_size = image_size
 
         with_sigmoid = loss_type == 'BCE'
 
-        self.discriminator_0and1 = DiscriminatorFactorConv(1, 64,
-                                                           4,2,1,
-                                                           dim_x_y=image_size,
-                                                           inner_channels_per_layer = hidden_layer_size,
-                                                           with_sigmoid = with_sigmoid)
-        self.discriminator_1and2 = DiscriminatorFactorConv(64, 128,
-                                                           4, 2, 1,
-                                                           dim_x_y=image_size//2,
-                                                           inner_channels_per_layer = hidden_layer_size,
-                                                           with_sigmoid = with_sigmoid)
-        self.discriminator_2and3 = DiscriminatorFactorFC(128 * (image_size // 4) ** 2 + 1024,
-                                                         hidden_layer_size,
+        self.discriminator_0 = DiscriminatorFactorConv(1,
+                                                       4,2,1,
+                                                       with_sigmoid = with_sigmoid)
+        self.discriminator_1= DiscriminatorFactorConv(64,
+                                                       4, 2, 1,
+                                                       with_sigmoid = with_sigmoid)
+        self.discriminator_2= DiscriminatorFactor(128*7*7,
+                                                       with_sigmoid = with_sigmoid)
+        self.discriminator_3 = DiscriminatorFactor(1024,
                                                          with_sigmoid)
-        self.discriminator_3and4 = DiscriminatorFactorFC(noise_dim + 1024,
-                                                         hidden_layer_size,
+        self.discriminator_4 = DiscriminatorFactor(noise_dim,
                                                          with_sigmoid)
 
-        self.Ds = [self.discriminator_0and1, self.discriminator_1and2,
-                   self.discriminator_2and3, self.discriminator_3and4]
+        self.Ds = [self.discriminator_0, self.discriminator_1,
+                   self.discriminator_2, self.discriminator_3, self.discriminator_4]
 
         self.log_intermediate_Ds = log_intermediate_Ds
         self.intermediate_Ds = {layer: [] for layer in self.layer_names}
 
         self.which_layers = 'all'
-        self.no_backprop_through_full_cortex = no_backprop_through_full_cortex
 
-    def forward(self, network_state_dict, inference_or_generation='inference'):
+    def forward(self, network_state_dict):
         """
         A note on inference_or_generation:
         If the backprop_through_full_FG flag is False, then we need to detach part of the
@@ -569,22 +443,9 @@ class Discriminator(nn.Module):
                 continue
 
             h1 = network_state_dict[self.layer_names[i]]
-            h2 = network_state_dict[self.layer_names[i + 1]]
 
-            # layer2 is stored as FC, so to compare to layer1 we need to reshape it
-            if i==1:
-                h2 = h2.view(-1, 128, self.image_size//4, self.image_size//4 )
-            # h1 = h1.view(h1.size()[0], -1)
+            this_d = D(h1).view(-1, 1)
 
-            if self.no_backprop_through_full_cortex:
-                if inference_or_generation == 'inference':
-                    h1 = h1.detach()
-                elif inference_or_generation == 'generation':
-                    h2 = h2.detach()
-                else:
-                    raise AssertionError("inference_or_generation should be in ['inference', 'generation']")
-
-            this_d = D(h1, h2).view(-1, 1)
             d = d + this_d
 
             if self.log_intermediate_Ds:
@@ -600,50 +461,15 @@ class Discriminator(nn.Module):
                 continue
 
             h1i = inference_state_dict[self.layer_names[i]].detach()
-            h2i = inference_state_dict[self.layer_names[i + 1]].detach()
 
             h1g = generator_state_dict[self.layer_names[i]].detach()
-            h2g = generator_state_dict[self.layer_names[i + 1]].detach()
 
-
-
-            # h2g = h2g.view(h2g.size()[0], -1)
-            # h1g = h1g.view(h1g.size()[0], -1)
-            #
-            # h2i = h2i.view(h2i.size()[0], -1)
-            # h1i = h1i.view(h1i.size()[0], -1)
-
-            # layer2 is stored as FC, so to compare to layer1 we need to reshape it
-            if i==1:
-                h2i = h2i.view(-1, 128, self.image_size//4, self.image_size//4 )
-                h2g = h2g.view(-1, 128, self.image_size//4, self.image_size//4 )
-
-            gp = gp + calc_gradient_penalty(D, (h1i, h2i), (h1g, h2g), LAMBDA=self.lambda_)
+            gp = gp + calc_gradient_penalty(D, h1i, h1g, LAMBDA=self.lambda_)
 
         return gp / float(i)
 
-
-def alpha_interpolate(tensor1, tensor2):
-    "Returns a tensor interpolated between these two tensors, with some random about per example in the batch."
-    size = tensor1.size()
-
-    alpha = torch.rand(size[0], 1)
-
-    # this just makes the random vector the same size as the tensor. I wish this were easier.
-    if len(size) == 2:
-        alpha = alpha.expand(size).to(tensor1.device)
-    elif len(size) == 4:
-        alpha = alpha[:, :, None, None].repeat(1, 1, size[2], size[3])
-        alpha = alpha.to(tensor1.device)
-    else:
-        raise NotImplementedError()
-
-    interpolated = alpha * tensor1 + ((1 - alpha) * tensor2)
-
-    return interpolated
-
 def alpha_spherical_interpolate(tensor1, tensor2):
-    "Returns a tensor interpolated between these two tensors, with some random about per example in the batch."
+    "Returns a tensor interpolated between these two tensors, with some random alpha per example in the batch."
     size = tensor1.size()
     alpha = torch.rand(size[0], 1).to(tensor1.device)
 
@@ -673,31 +499,26 @@ def slerp(interp, low, high):
     return out
 
 
-def calc_gradient_penalty(netD, real_data_tuple, fake_data_tuple, LAMBDA=.1):
+def calc_gradient_penalty(netD, real_data, fake_data, LAMBDA=.1):
     """A general utility function modified from a WGAN-GP implementation.
+    """
 
-    Not pretty rn; TODO make prettier"""
+    batch_size = real_data.size()[0]
 
-    batch_size = real_data_tuple[0].size()[0]
+    interpolated = alpha_spherical_interpolate(real_data, fake_data)
+    interpolated = Variable(interpolated, requires_grad=True)
 
-    interpolates0 = alpha_spherical_interpolate(real_data_tuple[0], fake_data_tuple[0])
-    interpolates0 = Variable(interpolates0, requires_grad=True)
+    disc_interpolates = netD(interpolated)
 
-    interpolates1 = alpha_spherical_interpolate(real_data_tuple[1], fake_data_tuple[1])
-    interpolates1 = Variable(interpolates1, requires_grad=True)
+    gradients = grad(outputs=disc_interpolates, inputs=interpolated,
+                                  grad_outputs=torch.ones(disc_interpolates.size()).to(real_data.device),
+                                  create_graph=True, retain_graph=True, only_inputs=True)[0]
 
-    disc_interpolates = netD(interpolates0, interpolates1)
+    gradients= gradients.view(batch_size, -1)
 
-    gradients0, gradients1 = grad(outputs=disc_interpolates, inputs=[interpolates0, interpolates1],
-                                  grad_outputs=torch.ones(disc_interpolates.size()).to(real_data_tuple[0].device),
-                                  create_graph=True, retain_graph=True, only_inputs=True)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * LAMBDA
 
-    gradients0, gradients1 = gradients0.view(batch_size, -1), gradients1.view(batch_size, -1)
-
-    gradient_penalty = ((gradients0.norm(2, dim=1) - 1) ** 2 +
-                        (gradients1.norm(2, dim=1) - 1) ** 2).mean() * LAMBDA
     return gradient_penalty
-
 
 
 

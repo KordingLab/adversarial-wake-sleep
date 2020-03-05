@@ -160,8 +160,8 @@ def train(args, cortex, train_loader, discriminator, train_history,
         # now update the inference and generator to fight the discriminator
 
         if args.loss_type == 'hinge' or args.loss_type == 'wasserstein':
-            gen_loss = -discriminator(cortex.generator.intermediate_state_dict, 'generation').mean() + \
-                       discriminator(cortex.inference.intermediate_state_dict, 'inference').mean()
+            gen_loss = -discriminator(cortex.generator.intermediate_state_dict).mean() + \
+                       discriminator(cortex.inference.intermediate_state_dict).mean()
         else:
             gen_loss = nn.BCELoss()(discriminator(cortex.generator.intermediate_state_dict),
                                     Variable(torch.ones(batch_size, 1).cuda(args.gpu))) + \
@@ -206,9 +206,8 @@ def main(args):
                                     backprop_to_start_inf=bp_thru_inf,
                                     backprop_to_start_gen=bp_thru_gen).cuda(args.gpu)
 
-    discriminator = Discriminator(args.disc_hidden_dim, cortex.layer_names, lambda_=args.lamda, loss_type=args.loss_type,
+    discriminator = Discriminator(cortex.layer_names, lambda_=args.lamda, loss_type=args.loss_type,
                                   noise_dim=args.noise_dim,
-                                  image_size=mnist_size[1],
                                   log_intermediate_Ds=args.detailed_logging).cuda(args.gpu)
 
     kwargs = {'num_workers': args.workers, 'pin_memory': True}
