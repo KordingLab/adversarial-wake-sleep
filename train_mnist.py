@@ -219,8 +219,9 @@ def main(args):
                                     backprop_to_start_gen=bp_thru_gen,
                                     normalize=args.normalize).cuda(args.gpu)
 
-    discriminator = Discriminator(cortex.layer_names, lambda_=args.lamda, loss_type=args.loss_type,
-                                  noise_dim=args.noise_dim,
+    discriminator = Discriminator( args.disc_hidden_dim,cortex.layer_names,
+                                  lambda_=args.lamda, loss_type=args.loss_type,
+                                  noise_dim=args.noise_dim, image_size=mnist_size[1],
                                   log_intermediate_Ds=args.detailed_logging).cuda(args.gpu)
 
     kwargs = {'num_workers': args.workers, 'pin_memory': True}
