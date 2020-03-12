@@ -62,6 +62,8 @@ class Generator(nn.Module):
                                                     ('Layer4', None)])
         self.layer_names = list(self.intermediate_state_dict.keys())
 
+
+
     def get_detached_state_dict(self):
         detached_dict = {k: None if (v is None) else v.detach() for k, v in self.intermediate_state_dict.items()}
         return detached_dict
@@ -289,6 +291,41 @@ class DeterministicHelmholtz(nn.Module):
                 upper_h = upper_h.view(-1, 128, self.image_size // 4, self.image_size // 4)
 
             layerwise_surprisal = self.mse(G(upper_h), lower_h)
+            if i in self.which_layers:
+                ML_loss = ML_loss + layerwise_surprisal
+
+            if self.log_intermediate_surprisals:
+                self.intermediate_surprisals[self.layer_names[i]].append(layerwise_surprisal.item())
+
+        ML_loss = ML_loss / self.surprisal_sigma
+
+        return ML_loss
+
+    def inference_surprisal(self):
+        """Given the current inference state, ascertain how surprised the generator model was.
+        Equivalent to minimizing the reconstruction error (i->i-1->i) during generation.
+        """
+        # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
+        # with Gaussian we have log p  = MSE between actual and predicted
+
+        if self.generator.intermediate_state_dict['Input'] is None:
+            raise AssertionError("Inference must be run first before calculating this.")
+
+        ML_loss = 0
+
+        for i, F in enumerate(self.inference_modules):
+            if i not in self.which_layers:
+                continue
+
+            lower_h = self.generator.intermediate_state_dict[self.layer_names[i]].detach()
+            upper_h = self.generator.intermediate_state_dict[self.layer_names[i + 1]].detach()
+
+            # layer2 is stored unraveled, so to compare we need to reshape the output
+            F_upper_h = F(lower_h)
+            if self.layer_names[i] == "Layer1":
+                F_upper_h = F_upper_h.view(-1, 128 * self.image_size // 4 * self.image_size // 4)
+
+            layerwise_surprisal = self.mse(upper_h, F_upper_h)
             if i in self.which_layers:
                 ML_loss = ML_loss + layerwise_surprisal
 
