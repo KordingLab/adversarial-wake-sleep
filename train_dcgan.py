@@ -345,6 +345,8 @@ def main_worker(gpu, ngpus_per_node, args):
     bp_thru_inf = (not args.no_backprop_through_full_cortex) and (not args.only_backprop_generator)
     bp_thru_gen = (not args.no_backprop_through_full_cortex)
 
+    bn = False if args.loss_type == 'wasserstein' else True
+
 
     cortex = DeterministicHelmholtz(args.noise_dim, args.n_filters, nc,
                                     image_size=image_size,
@@ -353,7 +355,8 @@ def main_worker(gpu, ngpus_per_node, args):
                                     log_intermediate_reconstructions=args.detailed_logging,
                                     log_weight_alignment=args.detailed_logging,
                                     backprop_to_start_inf=bp_thru_inf,
-                                    backprop_to_start_gen=bp_thru_gen)
+                                    backprop_to_start_gen=bp_thru_gen,
+                                    batchnorm = bn)
 
     discriminator = Discriminator(image_size, args.disc_hidden_dim, cortex.layer_names,
                                   args.noise_dim, args.n_filters, nc,
