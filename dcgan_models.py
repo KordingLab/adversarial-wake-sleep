@@ -276,7 +276,7 @@ class DeterministicHelmholtz(nn.Module):
 
         ML_loss = ML_loss / self.surprisal_sigma
 
-        return ML_loss  # / float(len(self.generator.listed_modules))
+        return ML_loss
 
     def inference_surprisal(self):
         """Given the current inference state, ascertain how surprised the generator model was.
@@ -290,28 +290,22 @@ class DeterministicHelmholtz(nn.Module):
 
         ML_loss = 0
 
-        for i, F in enumerate(self.inference_modules):
+        for i, F in enumerate(self.inference.listed_modules):
             if i not in self.which_layers:
                 continue
 
             lower_h = self.generator.intermediate_state_dict[self.layer_names[i]].detach()
             upper_h = self.generator.intermediate_state_dict[self.layer_names[i + 1]].detach()
 
-            # layer2 is stored unraveled, so to compare we need to reshape the output
             F_upper_h = F(lower_h)
-            if self.layer_names[i] == "Layer1":
-                F_upper_h = F_upper_h.view(-1, 128 * self.image_size // 4 * self.image_size // 4)
 
             layerwise_surprisal = self.mse(upper_h, F_upper_h)
             if i in self.which_layers:
                 ML_loss = ML_loss + layerwise_surprisal
 
-            if self.log_intermediate_surprisals:
-                self.intermediate_surprisals[self.layer_names[i]].append(layerwise_surprisal.item())
-
         ML_loss = ML_loss / self.surprisal_sigma
 
-        return ML_loss  # / float(len(self.generator_modules))
+        return ML_loss
 
 
     def log_layerwise_reconstructions(self):
@@ -431,51 +425,53 @@ class DiscriminatorFactorConv(nn.Module):
                  batchnorm = True):
         super(DiscriminatorFactorConv, self).__init__()
         assert dim_x_y % 4 == 0
-        n_inter_layers = 0 if (dim_x_y<8) else int(math.log2(dim_x_y//8))
+        n_inter_layers = 0 if (dim_x_y==4) else int(math.log2(dim_x_y//4))
 
         # handle the averaging operation
         self.avg_after_n_layers = avg_after_n_layers
         if avg_after_n_layers is not False:
-            assert avg_after_n_layers > 1
-            n_inter_layers = min(n_inter_layers, avg_after_n_layers-2)
+            assert avg_after_n_layers > 0
+            n_inter_layers = min(n_inter_layers, avg_after_n_layers-1)
+        else:
+            avg_after_n_layers = 0
 
-        ## Layer 1 combines the two layers of the inference/generator network into 1
-        self.conv_over_h1 = nn.Conv2d(h1_channels, inner_channels_per_layer // 2,
-                                      conv_kernel, conv_stride, conv_pad  )
 
-            # the result of the upper conv must have the same 2d size as the lower conv
-            # (even though the original layer sizes will be different)
-        self.conv_over_h2 = nn.Conv2d(h2_channels, inner_channels_per_layer // 2,
-                                      conv_kernel-1, 1, int((conv_kernel) / 4)  )
+        self.upsample = nn.Upsample(size=(dim_x_y,dim_x_y), mode='bilinear', align_corners=True)
+
         self.relu = nn.LeakyReLU(.2, inplace = True)
 
-        ## Then we pare down this combined hidden state to a logit
-        # The last layer is always kernel=4, stride = 0
-        # we intersperse a number of dimesion-halving layers in between depending on the original size
-        self.mid_disc_layers = nn.ModuleList([nn.Sequential(nn.Conv2d((2 ** i) * inner_channels_per_layer,
-                                                        (2 ** (i+1)) * inner_channels_per_layer,
-                                                        4,2,1 ),
-                                      nn.BatchNorm2d(inner_channels_per_layer * (2 ** (i+1))) if batchnorm else null(),
-                                      nn.LeakyReLU(.2, inplace = True))
-                                  for i in range(n_inter_layers)])
+        ## Then we pare down this combined hidden state to a logit.
+        # The last layer is always kernel=4, stride = 0.
+        # we intersperse a number of size-halving layers in between depending on the original size.
+        # the number of channels doubles with each layer.
+        self.mid_disc_layers = nn.ModuleList([nn.Sequential(nn.Conv2d((h1_channels+h2_channels) if i==0 else
+                                                                        (2 ** (i-1)) * inner_channels_per_layer,
+                                                                        (2 ** i) * inner_channels_per_layer,
+                                                                        4,2,1),
+                                                            nn.BatchNorm2d(inner_channels_per_layer * (2 ** (i+1))) if batchnorm else null(),
+                                                            nn.LeakyReLU(.2, inplace=True))
+                                                for i in range(n_inter_layers)])
 
-        n_final_dims = (2 ** n_inter_layers) * inner_channels_per_layer
+        n_final_dims = (2 ** (n_inter_layers-1)) * inner_channels_per_layer
+        self.eval_std_dev = eval_std_dev
         if eval_std_dev:
             n_final_dims += 1
-        self.eval_std_dev = eval_std_dev
 
-        self.last_disc_layer = nn.Conv2d(n_final_dims,
-                                            1,
-                                            dim_x_y//2 if dim_x_y<8 else 4, 1, 0)
+        #if we're averaging over many decisions of a convolved sub-discriminator,
+        # that is if the n_inter_layers was greater than the number of layers before averaging,
+        # we want the kernel to be 1. else it's 4.
+        if n_inter_layers > avg_after_n_layers-1:
+            self.last_disc_layer = nn.Conv2d(n_final_dims, 1, 4, 1, 0)
+        else:
+            self.last_disc_layer = nn.Conv2d(n_final_dims, 1, 1, 1, 0)
 
 
         self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null()
 
     def forward(self, h1, h2):
-        #layer 1
-        conved_h1 = self.conv_over_h1(h1)
-        conved_h2 = self.conv_over_h2(h2)
-        x = torch.cat([conved_h1, conved_h2], dim=1)
+        # combine lower and upsampled layers into a single block
+        upsampled_h2 = self.upsample(h2)
+        x = torch.cat([h1, upsampled_h2], dim=1)
         x = self.relu(x)
 
         # intermediate layers
