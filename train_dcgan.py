@@ -83,6 +83,8 @@ parser.add_argument('--surprisal-sigma', default=1, type=float,
              ' Equivalent to minimizing the reconstruction error from inference states, up one layer, and back down.')
 parser.add_argument('--minimize-generator-surprisal', action='store_true',
                     help='Minimize generator surprisal using value of sigma set.')
+parser.add_argument('--minimize-inference-surprisal', action='store_true',
+                    help='Minimize generator surprisal using value of sigma set.')
 parser.add_argument('--lamda', default=.1, type=float,
                     help='Lambda for the gradient penalty in the WGAN formulation. Only for Wasserstein loss.')
 parser.add_argument('--noise-sigma', default=0, type=float,
@@ -163,10 +165,8 @@ def train(args, cortex, train_loader, discriminator,
         # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
         # with Gaussian we have log p  = MSE between actual and predicted
         ML_loss = cortex.generator_surprisal()
-        if epoch > ml_after_epoch:
+        if args.minimize_generator_surprisal:
             ML_loss.backward()
-            optimizerG.step()
-            optimizerG.zero_grad()
 
         # We could update the discriminator here too, if we want.
         # For efficiency I'm putting it later (in the 'sleep') section
@@ -176,6 +176,10 @@ def train(args, cortex, train_loader, discriminator,
         # fantasize
 
         generated_input = cortex.noise_and_generate(noise_layer)
+
+        if args.minimize_inference_surprisal:
+            ML_loss = cortex.inference_surprisal()
+            ML_loss.backward()
 
         if args.label_smoothing:
             #with prob .1 we switch the labels
