@@ -328,12 +328,13 @@ class null(nn.Module):
 class DiscriminatorFactorFC(nn.Module):
     """To discriminate between two full-connected layers"""
 
-    def __init__(self, input_size, hidden_size, with_sigmoid=False, batchnorm = True):
+    def __init__(self, input_size, hidden_size, with_sigmoid=False, batchnorm = True, eval_std_dev = False):
         super(DiscriminatorFactorFC, self).__init__()
+        self.eval_std_dev = eval_std_dev
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.relu = nn.LeakyReLU()
-
-        self.fc2 = nn.Linear(hidden_size, 1)
+        d= 1 if eval_std_dev else 0
+        self.fc2 = nn.Linear(hidden_size+d, 1)
         self.bn = nn.BatchNorm1d(hidden_size) if batchnorm else null()
         self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null()
 
@@ -347,6 +348,12 @@ class DiscriminatorFactorFC(nn.Module):
         out = self.fc1(x)
         out = self.bn(out)
         out = self.relu(out)
+
+        if self.eval_std_dev:
+            sd = torch.mean(torch.sqrt(torch.var(out,0)+1e-8))
+            to_cat = torch.ones(out.size()[0],1).to(out.device) * sd
+            out = torch.cat([out, to_cat], dim=1)
+
         out = self.fc2(out)
         out = self.out_nonlinearity(out)
 
@@ -417,7 +424,7 @@ class DiscriminatorFactorConv(nn.Module):
 
         n_final_dims = (2 ** n_inter_layers) * inner_channels_per_layer
         if eval_std_dev:
-            n_final_dims += (2 ** n_inter_layers)
+            n_final_dims += 1
         self.eval_std_dev = eval_std_dev
 
         self.last_disc_layer = nn.Conv2d(n_final_dims,
@@ -484,7 +491,9 @@ class Discriminator(nn.Module):
     def __init__(self, image_size, hidden_layer_size, layer_names,
                  noise_dim, n_filters, n_img_channels,
                  lambda_=0, loss_type='wasserstein',
-                 log_intermediate_Ds=False):
+                 log_intermediate_Ds=False,
+                 eval_std_dev=False
+                 ):
         super(Discriminator, self).__init__()
 
         self.layer_names = layer_names
@@ -499,30 +508,35 @@ class Discriminator(nn.Module):
                                                            dim_x_y=image_size,
                                                            inner_channels_per_layer=hidden_layer_size,
                                                            with_sigmoid=with_sigmoid,
-                                                           batchnorm = batchnorm)
+                                                           batchnorm = batchnorm,
+                                                           eval_std_dev = eval_std_dev)
         self.discriminator_1and2 = DiscriminatorFactorConv(n_filters, n_filters * 2,
                                                            4, 2, 1,
                                                            dim_x_y=image_size//2,
                                                            inner_channels_per_layer=hidden_layer_size,
                                                            with_sigmoid=with_sigmoid,
-                                                           batchnorm = batchnorm)
+                                                           batchnorm = batchnorm,
+                                                           eval_std_dev = eval_std_dev)
         self.discriminator_2and3 = DiscriminatorFactorConv(n_filters * 2, n_filters * 4,
                                                            4, 2, 1,
                                                            dim_x_y=image_size//4,
                                                            inner_channels_per_layer=hidden_layer_size,
                                                            with_sigmoid=with_sigmoid,
-                                                           batchnorm = batchnorm)
+                                                           batchnorm = batchnorm,
+                                                           eval_std_dev = eval_std_dev)
         self.discriminator_3and4 = DiscriminatorFactorConv(n_filters * 4, n_filters * 8,
                                                            4, 2, 1,
                                                            dim_x_y=image_size//8,
                                                            inner_channels_per_layer=hidden_layer_size,
                                                            with_sigmoid=with_sigmoid,
-                                                           batchnorm = batchnorm)
+                                                           batchnorm = batchnorm,
+                                                           eval_std_dev = eval_std_dev)
         self.discriminator_4and5 = DiscriminatorFactorFC((image_size //16)** 2 * n_filters * 8 +
                                                           noise_dim,
                                                           noise_dim*2,
                                                           with_sigmoid,
-                                                          batchnorm=batchnorm)
+                                                          batchnorm=batchnorm,
+                                                          eval_std_dev = eval_std_dev)
 
         self.Ds = [self.discriminator_0and1, self.discriminator_1and2,
                    self.discriminator_2and3, self.discriminator_3and4, self.discriminator_4and5]

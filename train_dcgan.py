@@ -108,6 +108,9 @@ parser.add_argument('--historical-averaging',  default=0, type=float,
 parser.add_argument('--sequential-training', action='store_true',
                     help='Train the first layer to completion, then add on the other ones. '
                     'Noise in injected at the top of the layer being trained (as the prior). Other layers are frozen.')
+parser.add_argument('--minibatch-std-dev', action='store_true',
+                    help='Evaluate the standard deviation of the features in the 2nd-to-last layer of the discriminator'
+                    ' and add it as a feature. As in progressiveGAN.')
 
 # parser.add_argument('--only-match-F-to-G', action='store_true',
 #                     help='Instead of mutually matching the network states to each other, only optimize'
@@ -361,7 +364,8 @@ def main_worker(gpu, ngpus_per_node, args):
     discriminator = Discriminator(image_size, args.disc_hidden_dim, cortex.layer_names,
                                   args.noise_dim, args.n_filters, nc,
                                   lambda_=args.lamda, loss_type=args.loss_type,
-                                  log_intermediate_Ds=args.detailed_logging)
+                                  log_intermediate_Ds=args.detailed_logging,
+                                  eval_std_dev = args.minibatch_std_dev)
 
     # get to proper GPU
     if args.distributed:
