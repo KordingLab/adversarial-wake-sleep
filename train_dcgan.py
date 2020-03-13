@@ -111,6 +111,11 @@ parser.add_argument('--sequential-training', action='store_true',
 parser.add_argument('--minibatch-std-dev', action='store_true',
                     help='Evaluate the standard deviation of the features in the 2nd-to-last layer of the discriminator'
                     ' and add it as a feature. As in progressiveGAN.')
+parser.add_argument('--avg-after-n-layers', default=0, type=int,
+                    help="""convolve this many layers and, if this many layers doesn't shrink the
+                            x and y dimensions to 1, just average over the x and y channels instead of continuing
+                            to convolve down. Designed to prevent lower-layer discriminators from learning to
+                            discriminate global image structure. Not used if set to False.""")
 
 # parser.add_argument('--only-match-F-to-G', action='store_true',
 #                     help='Instead of mutually matching the network states to each other, only optimize'
@@ -349,6 +354,7 @@ def main_worker(gpu, ngpus_per_node, args):
     bp_thru_gen = (not args.no_backprop_through_full_cortex)
 
     bn = False if args.loss_type == 'wasserstein' else True
+    avg_after_n_layers = False if args.avg_after_n_layers<2 else args.avg_after_n_layers
 
 
     cortex = DeterministicHelmholtz(args.noise_dim, args.n_filters, nc,
@@ -365,6 +371,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                   args.noise_dim, args.n_filters, nc,
                                   lambda_=args.lamda, loss_type=args.loss_type,
                                   log_intermediate_Ds=args.detailed_logging,
+                                  avg_after_n_layers=avg_after_n_layers,
                                   eval_std_dev = args.minibatch_std_dev)
 
     # get to proper GPU

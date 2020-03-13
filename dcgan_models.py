@@ -378,7 +378,7 @@ class DiscriminatorFactorConv(nn.Module):
 
     with_sigmoid = Boolean. Whether to apply a sigmoid to the output of each inner Discriminator, as required when
                         averaging (ensembling) multiple discriminators in a standard GAN with BCELoss
-    avg_after_n_layers = Int > 0 (or False): convolve this many layers and, if this many layers doesn't shrink the
+    avg_after_n_layers = Int > 1 (or False): convolve this many layers and, if this many layers doesn't shrink the
                             x and y dimensions to 1, just average over the x and y channels instead of continuing
                             to convolve down. Designed to prevent lower-layer discriminators from learning to
                             discriminate global image structure. Not used if set to False.
@@ -398,9 +398,10 @@ class DiscriminatorFactorConv(nn.Module):
         n_inter_layers = 0 if (dim_x_y<8) else int(math.log2(dim_x_y//8))
 
         # handle the averaging operation
+        self.avg_after_n_layers = avg_after_n_layers
         if avg_after_n_layers is not False:
-            # not implemented yet
-            pass
+            assert avg_after_n_layers > 1
+            n_inter_layers = min(n_inter_layers, avg_after_n_layers-2)
 
         ## Layer 1 combines the two layers of the inference/generator network into 1
         self.conv_over_h1 = nn.Conv2d(h1_channels, inner_channels_per_layer // 2,
@@ -455,6 +456,9 @@ class DiscriminatorFactorConv(nn.Module):
         # finally, maybe, apply a sigmoid nonlinearity
         x = self.out_nonlinearity(x)
 
+        if self.avg_after_n_layers:
+            x = x.mean(dim=3).mean(dim=2)
+
         return x
 
 def stdDev(x):
@@ -492,8 +496,8 @@ class Discriminator(nn.Module):
                  noise_dim, n_filters, n_img_channels,
                  lambda_=0, loss_type='wasserstein',
                  log_intermediate_Ds=False,
-                 eval_std_dev=False
-                 ):
+                 eval_std_dev=False,
+                 avg_after_n_layers=False):
         super(Discriminator, self).__init__()
 
         self.layer_names = layer_names
@@ -503,34 +507,28 @@ class Discriminator(nn.Module):
         with_sigmoid = loss_type == 'BCE'
         batchnorm = not loss_type == "wasserstein"
 
+        kw_args = {"inner_channels_per_layer": hidden_layer_size,
+                   "with_sigmoid": with_sigmoid,
+                   "batchnorm": batchnorm,
+                   "eval_std_dev": eval_std_dev,
+                   "avg_after_n_layers": avg_after_n_layers}
+
         self.discriminator_0and1 = DiscriminatorFactorConv(n_img_channels, n_filters,
                                                            4, 2, 1,
                                                            dim_x_y=image_size,
-                                                           inner_channels_per_layer=hidden_layer_size,
-                                                           with_sigmoid=with_sigmoid,
-                                                           batchnorm = batchnorm,
-                                                           eval_std_dev = eval_std_dev)
+                                                           **kw_args)
         self.discriminator_1and2 = DiscriminatorFactorConv(n_filters, n_filters * 2,
                                                            4, 2, 1,
                                                            dim_x_y=image_size//2,
-                                                           inner_channels_per_layer=hidden_layer_size,
-                                                           with_sigmoid=with_sigmoid,
-                                                           batchnorm = batchnorm,
-                                                           eval_std_dev = eval_std_dev)
+                                                           **kw_args)
         self.discriminator_2and3 = DiscriminatorFactorConv(n_filters * 2, n_filters * 4,
                                                            4, 2, 1,
                                                            dim_x_y=image_size//4,
-                                                           inner_channels_per_layer=hidden_layer_size,
-                                                           with_sigmoid=with_sigmoid,
-                                                           batchnorm = batchnorm,
-                                                           eval_std_dev = eval_std_dev)
+                                                           **kw_args)
         self.discriminator_3and4 = DiscriminatorFactorConv(n_filters * 4, n_filters * 8,
                                                            4, 2, 1,
                                                            dim_x_y=image_size//8,
-                                                           inner_channels_per_layer=hidden_layer_size,
-                                                           with_sigmoid=with_sigmoid,
-                                                           batchnorm = batchnorm,
-                                                           eval_std_dev = eval_std_dev)
+                                                           **kw_args)
         self.discriminator_4and5 = DiscriminatorFactorFC((image_size //16)** 2 * n_filters * 8 +
                                                           noise_dim,
                                                           noise_dim*2,
