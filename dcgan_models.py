@@ -418,13 +418,13 @@ class DiscriminatorFactorConv(nn.Module):
     """
 
     def __init__(self, h1_channels, h2_channels,
-                 conv_kernel, conv_stride, conv_pad, inner_channels_per_layer,
                  dim_x_y,
                  avg_after_n_layers = False, eval_std_dev = False,
                  with_sigmoid=False,
                  batchnorm = True):
         super(DiscriminatorFactorConv, self).__init__()
         assert dim_x_y % 4 == 0
+        self.dim_x_y=dim_x_y
         n_inter_layers = 0 if (dim_x_y==4) else int(math.log2(dim_x_y//4))
 
         # handle the averaging operation
@@ -435,24 +435,23 @@ class DiscriminatorFactorConv(nn.Module):
         else:
             avg_after_n_layers = 0
 
-
-        self.upsample = nn.Upsample(size=(dim_x_y,dim_x_y), mode='bilinear', align_corners=True)
-
         self.relu = nn.LeakyReLU(.2, inplace = True)
+
+        inner_channels_per_layer = (h1_channels+h2_channels)
 
         ## Then we pare down this combined hidden state to a logit.
         # The last layer is always kernel=4, stride = 0.
         # we intersperse a number of size-halving layers in between depending on the original size.
         # the number of channels doubles with each layer.
-        self.mid_disc_layers = nn.ModuleList([nn.Sequential(nn.Conv2d((h1_channels+h2_channels) if i==0 else
-                                                                        (2 ** (i-1)) * inner_channels_per_layer,
-                                                                        (2 ** i) * inner_channels_per_layer,
-                                                                        4,2,1),
+        self.mid_disc_layers = nn.ModuleList([nn.Sequential(nn.Conv2d((2 ** i) * inner_channels_per_layer,
+                                                                      (2 ** (i+1)) * inner_channels_per_layer,
+                                                                      4,2,1),
                                                             nn.BatchNorm2d(inner_channels_per_layer * (2 ** (i+1))) if batchnorm else null(),
                                                             nn.LeakyReLU(.2, inplace=True))
                                                 for i in range(n_inter_layers)])
 
-        n_final_dims = (2 ** (n_inter_layers-1)) * inner_channels_per_layer
+        n_final_dims = (2 ** n_inter_layers) * inner_channels_per_layer
+
         self.eval_std_dev = eval_std_dev
         if eval_std_dev:
             n_final_dims += 1
@@ -469,8 +468,12 @@ class DiscriminatorFactorConv(nn.Module):
         self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null()
 
     def forward(self, h1, h2):
+        #size check
+        s = h1.size()[2]
+        assert s == self.dim_x_y
         # combine lower and upsampled layers into a single block
-        upsampled_h2 = self.upsample(h2)
+        upsampled_h2 = nn.functional.interpolate(h2, size=(s,s), mode='bilinear', align_corners=True)
+
         x = torch.cat([h1, upsampled_h2], dim=1)
         x = self.relu(x)
 
@@ -539,26 +542,21 @@ class Discriminator(nn.Module):
         with_sigmoid = loss_type == 'BCE'
         batchnorm = not loss_type == "wasserstein"
 
-        kw_args = {"inner_channels_per_layer": hidden_layer_size,
-                   "with_sigmoid": with_sigmoid,
+        kw_args = {"with_sigmoid": with_sigmoid,
                    "batchnorm": batchnorm,
                    "eval_std_dev": eval_std_dev,
                    "avg_after_n_layers": avg_after_n_layers}
 
         self.discriminator_0and1 = DiscriminatorFactorConv(n_img_channels, n_filters,
-                                                           4, 2, 1,
                                                            dim_x_y=image_size,
                                                            **kw_args)
         self.discriminator_1and2 = DiscriminatorFactorConv(n_filters, n_filters * 2,
-                                                           4, 2, 1,
                                                            dim_x_y=image_size//2,
                                                            **kw_args)
         self.discriminator_2and3 = DiscriminatorFactorConv(n_filters * 2, n_filters * 4,
-                                                           4, 2, 1,
                                                            dim_x_y=image_size//4,
                                                            **kw_args)
         self.discriminator_3and4 = DiscriminatorFactorConv(n_filters * 4, n_filters * 8,
-                                                           4, 2, 1,
                                                            dim_x_y=image_size//8,
                                                            **kw_args)
         self.discriminator_4and5 = DiscriminatorFactorFC((image_size //16)** 2 * n_filters * 8 +

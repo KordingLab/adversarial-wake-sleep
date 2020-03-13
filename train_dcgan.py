@@ -76,7 +76,7 @@ parser.add_argument('--disc-hidden-dim', default=32, type=int,
                     help='Dimensionality oftthe first conv layer in *each* discriminator. Default 32')
 parser.add_argument('--n-filters', default=64, type=int,
                     help='Number of filters in the first conv layer of the DCGAN. Default 64')
-parser.add_argument('--surprisal-sigma', default=1, type=float,
+parser.add_argument('--surprisal-sigma', default=10, type=float,
                     metavar='ss', help='How weakly to follow the gradient of the surprisal of the lower layers '
                      'given the upper layers inference activations and the generative model.'
                      ' Specifically the variance of the implied Gaussian noise of the output (but there is no noise.'
@@ -119,9 +119,6 @@ parser.add_argument('--avg-after-n-layers', default=0, type=int,
                             to convolve down. Designed to prevent lower-layer discriminators from learning to
                             discriminate global image structure. Not used if set to False.""")
 
-# parser.add_argument('--only-match-F-to-G', action='store_true',
-#                     help='Instead of mutually matching the network states to each other, only optimize'
-#                     ' F towards G. G is trained just as a GAN on the inputs, via backprop.')
 
 def train(args, cortex, train_loader, discriminator,
               optimizerD, optimizerG, optimizerF, epoch, ml_after_epoch = -1):
