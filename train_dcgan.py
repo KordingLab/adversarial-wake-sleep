@@ -72,8 +72,6 @@ parser.add_argument('--detailed-logging', action='store_true',
                     help='Whether to store detailed information about training metrics inside of the cortex object')
 parser.add_argument('--noise-dim', default=40, type=int, metavar='ND',
                     help='Dimensionality of the top layer of the cortex.')
-parser.add_argument('--disc-hidden-dim', default=32, type=int,
-                    help='Dimensionality oftthe first conv layer in *each* discriminator. Default 32')
 parser.add_argument('--n-filters', default=64, type=int,
                     help='Number of filters in the first conv layer of the DCGAN. Default 64')
 parser.add_argument('--surprisal-sigma', default=10, type=float,
@@ -118,6 +116,9 @@ parser.add_argument('--avg-after-n-layers', default=0, type=int,
                             x and y dimensions to 1, just average over the x and y channels instead of continuing
                             to convolve down. Designed to prevent lower-layer discriminators from learning to
                             discriminate global image structure. Not used if set to False.""")
+parser.add_argument('--upsample', action='store_true',
+                    help='Instead of applying a conv2d to h1 and h2 separate before combining,'
+                    ' upsample h2 and convolve separately.')
 
 
 def train(args, cortex, train_loader, discriminator,
@@ -368,12 +369,13 @@ def main_worker(gpu, ngpus_per_node, args):
                                     backprop_to_start_gen=bp_thru_gen,
                                     batchnorm = bn)
 
-    discriminator = Discriminator(image_size, args.disc_hidden_dim, cortex.layer_names,
+    discriminator = Discriminator(image_size, cortex.layer_names,
                                   args.noise_dim, args.n_filters, nc,
                                   lambda_=args.lamda, loss_type=args.loss_type,
                                   log_intermediate_Ds=args.detailed_logging,
                                   avg_after_n_layers=avg_after_n_layers,
-                                  eval_std_dev = args.minibatch_std_dev)
+                                  eval_std_dev = args.minibatch_std_dev,
+                                  upsample=args.upsample)
 
     # get to proper GPU
     if args.distributed:
