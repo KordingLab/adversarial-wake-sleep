@@ -8,7 +8,7 @@ from numpy import prod
 
 class Generator(nn.Module):
     def __init__(self, noise_dim, n_filters, n_img_channels, noise_sigma = 0, backprop_to_start = True,
-                 image_size = 64, batchnorm = False):
+                 image_size = 64, batchnorm = False, normalize = False):
         super(Generator, self).__init__()
         self.noise_dim = noise_dim
         self.n_filters = n_filters
@@ -20,28 +20,32 @@ class Generator(nn.Module):
             nn.ConvTranspose2d(     noise_dim, n_filters * 8, image_size//16, 1, 0 ),
             RescaleAndAddNoise( n_filters * 8, image_size//16,noise_sigma),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
-            nn.ReLU())
+            nn.ReLU(),
+            NormalizationLayer() if normalize else null())
 
         self.generative_4to3_conv = nn.Sequential(
             # state size. (n_filters*8) x 4 x 4
             nn.ConvTranspose2d(n_filters * 8, n_filters * 4, 4, 2, 1 ),
             RescaleAndAddNoise(n_filters * 4, 4, noise_sigma),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
-            nn.ReLU())
+            nn.ReLU(),
+            NormalizationLayer() if normalize else null())
 
         self.generative_3to2_conv = nn.Sequential(
             # state size. (n_filters*4) x 8 x 8
             nn.ConvTranspose2d(n_filters * 4, n_filters * 2, 4, 2, 1 ),
             RescaleAndAddNoise( n_filters * 2, 4,noise_sigma),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
-            nn.ReLU())
+            nn.ReLU(),
+            NormalizationLayer() if normalize else null())
 
         self.generative_2to1_conv = nn.Sequential(
             # state size. (n_filters*2) x 16 x 16
             nn.ConvTranspose2d(n_filters * 2,     n_filters, 4, 2, 1 ),
             RescaleAndAddNoise( n_filters, 4, noise_sigma),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
-            nn.ReLU())
+            nn.ReLU(),
+            NormalizationLayer() if normalize else null())
             # state size. (n_filters) x 32 x 32
 
         self.generative_1to0_conv = nn.Sequential(
@@ -80,13 +84,13 @@ class Generator(nn.Module):
             # Skip the topmost n layers ?
             if len(self.listed_modules) - i > from_layer:
                 continue
+
             self.intermediate_state_dict[layer_name] = x
 
             # this setting makes all gradient flow only go one layer back
             if not self.backprop_to_start:
                 x = x.detach()
             x = G(x)
-
 
         self.intermediate_state_dict["Input"] = x
 
@@ -95,7 +99,7 @@ class Generator(nn.Module):
 
 class Inference(nn.Module):
     def __init__(self, noise_dim, n_filters, n_img_channels, noise_sigma = 0, backprop_to_start = True,
-                 image_size = 64, batchnorm = False):
+                 image_size = 64, batchnorm = False, normalize = False):
         super(Inference, self).__init__()
         self.noise_dim = noise_dim
         self.n_filters = n_filters
@@ -112,25 +116,30 @@ class Inference(nn.Module):
             nn.Conv2d(n_filters * 4, n_filters * 8, 4, 2, 1 ),
             RescaleAndAddNoise(n_filters * 8, 4, noise_sigma),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
-            nn.ReLU())
+            nn.ReLU(),
+            NormalizationLayer() if normalize else null())
 
         self.inference_2to3_conv = nn.Sequential(
             nn.Conv2d(n_filters * 2, n_filters * 4, 4, 2, 1 ),
             RescaleAndAddNoise(n_filters * 4, 4, noise_sigma),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
-            nn.ReLU())
+            nn.ReLU(),
+            NormalizationLayer() if normalize else null())
 
         self.inference_1to2_conv = nn.Sequential(
             nn.Conv2d(n_filters, n_filters * 2, 4, 2, 1 ),
             RescaleAndAddNoise(n_filters * 2, 4, noise_sigma),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
-            nn.ReLU())
+            nn.ReLU(),
+            NormalizationLayer() if normalize else null())
 
         self.inference_0to1_conv = nn.Sequential(
             nn.Conv2d(n_img_channels, n_filters, 4, 2, 1 ),
             RescaleAndAddNoise(n_filters, 4, noise_sigma),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
-            nn.ReLU())
+            nn.ReLU(),
+            NormalizationLayer() if normalize else null())
+
 
         # list modules bottom to top. Probably a more general way exists
         self.listed_modules = [self.inference_0to1_conv,
@@ -189,15 +198,16 @@ class DeterministicHelmholtz(nn.Module):
                  log_weight_alignment=False,
                  backprop_to_start_inf=True,
                  backprop_to_start_gen=True,
-                 batchnorm = False):
+                 batchnorm = False,
+                 normalize=False):
         super(DeterministicHelmholtz, self).__init__()
 
         assert image_size % 16 == 0
 
         self.inference = Inference(noise_dim, n_filters, n_img_channels, noise_sigma, backprop_to_start_inf, image_size,
-                                   batchnorm=batchnorm)
+                                   batchnorm=batchnorm, normalize=normalize)
         self.generator = Generator(noise_dim, n_filters, n_img_channels, noise_sigma, backprop_to_start_gen, image_size,
-                                   batchnorm=batchnorm)
+                                   batchnorm=batchnorm, normalize=normalize)
 
         self.inference.apply(weights_init)
         self.generator.apply(weights_init)
@@ -889,3 +899,11 @@ def getLayerNormalizationFactor(module):
     fan_in = prod(size[1:])
 
     return math.sqrt(2.0 / fan_in)
+
+class NormalizationLayer(nn.Module):
+
+    def __init__(self):
+        super(NormalizationLayer, self).__init__()
+
+    def forward(self, x, epsilon=1e-8):
+        return x * (((x**2).mean(dim=1, keepdim=True) + epsilon).rsqrt())

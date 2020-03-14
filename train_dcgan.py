@@ -119,6 +119,8 @@ parser.add_argument('--avg-after-n-layers', default=0, type=int,
 parser.add_argument('--upsample', action='store_true',
                     help='Instead of applying a conv2d to h1 and h2 separate before combining,'
                     ' upsample h2 and convolve separately.')
+parser.add_argument('--divisive-normalization', action='store_true',
+                    help='Divisive normalization over channels, pixel by pixel. As in ProgressiveGANs')
 
 
 def train(args, cortex, train_loader, discriminator,
@@ -367,7 +369,8 @@ def main_worker(gpu, ngpus_per_node, args):
                                     log_weight_alignment=args.detailed_logging,
                                     backprop_to_start_inf=bp_thru_inf,
                                     backprop_to_start_gen=bp_thru_gen,
-                                    batchnorm = bn)
+                                    batchnorm = bn,
+                                    normalize = args.divisive_normalization)
 
     discriminator = Discriminator(image_size, cortex.layer_names,
                                   args.noise_dim, args.n_filters, nc,
