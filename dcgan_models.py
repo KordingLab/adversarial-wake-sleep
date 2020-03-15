@@ -393,8 +393,6 @@ class DiscriminatorFactorFC(nn.Module):
         out = self.fc1(x)
         out = self.bn(out)
         out = self.relu(out)
-        #He rescale
-        out = out * math.sqrt(2./ self.input_size)
 
 
         if self.eval_std_dev:
@@ -403,8 +401,6 @@ class DiscriminatorFactorFC(nn.Module):
             out = torch.cat([out, to_cat], dim=1)
 
         out = self.fc2(out)
-        #He rescale
-        out = out * math.sqrt(2./ self.hidden_size)
 
         out = self.out_nonlinearity(out)
 
@@ -509,7 +505,6 @@ class DiscriminatorFactorConv(nn.Module):
 
         #last layer
         x = self.last_disc_layer(x)
-        x = x*getLayerNormalizationFactor(self.last_disc_layer)
 
         # finally, maybe, apply a sigmoid nonlinearity
         x = self.out_nonlinearity(x)
@@ -597,8 +592,8 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
 
     def forward(self, h1, h2):
         # layer 1
-        conved_h1 = self.conv_over_h1(h1) * getLayerNormalizationFactor(self.conv_over_h1)
-        conved_h2 = self.conv_over_h2(h2) * getLayerNormalizationFactor(self.conv_over_h2)
+        conved_h1 = self.conv_over_h1(h1)
+        conved_h2 = self.conv_over_h2(h2)
         x = torch.cat([conved_h1, conved_h2], dim=1)
         x = self.relu(x)
 
@@ -611,7 +606,6 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
             x = stdDev(x)
         # last layer
         x = self.last_disc_layer(x)
-        x = x*getLayerNormalizationFactor(self.last_disc_layer)
 
         # finally, maybe, apply a sigmoid nonlinearity
         x = self.out_nonlinearity(x)
@@ -866,15 +860,15 @@ def slerp(interp, low, high):
 def weights_init(net):
     for m in net.modules():
         if isinstance(m, nn.Conv2d):
-            m.weight.data.normal_(0, 1)
+            m.weight.data.normal_(0, .02)
             if m.bias is not None:
                 m.bias.data.zero_()
         elif isinstance(m, nn.ConvTranspose2d):
-            m.weight.data.normal_(0, 1)
+            m.weight.data.normal_(0, 0.02)
             if m.bias is not None:
                 m.bias.data.zero_()
         elif isinstance(m, nn.Linear):
-            m.weight.data.normal_(0, 1)
+            m.weight.data.normal_(0, 0.02)
             if m.bias is not None:
                 m.bias.data.zero_()
 
@@ -882,7 +876,7 @@ class RescaleAndAddNoise(nn.Module):
     """
     First rescale the outputs of the previous layer based on that layer's He constant. Then,
     add zero-mean Gaussian noise of a given variance if noise_sigma is greater than 0; else do nothing."""
-    def __init__(self, in_channels, kernel, noise_sigma = 0, rescale = True):
+    def __init__(self, in_channels, kernel, noise_sigma = 0, rescale = False):
         super(RescaleAndAddNoise, self).__init__()
 
         if noise_sigma > 0:
