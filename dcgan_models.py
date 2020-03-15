@@ -372,6 +372,9 @@ class DiscriminatorFactorFC(nn.Module):
 
     def __init__(self, input_size, hidden_size, with_sigmoid=False, batchnorm = True, eval_std_dev = False):
         super(DiscriminatorFactorFC, self).__init__()
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+
         self.eval_std_dev = eval_std_dev
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.relu = nn.LeakyReLU()
@@ -390,6 +393,9 @@ class DiscriminatorFactorFC(nn.Module):
         out = self.fc1(x)
         out = self.bn(out)
         out = self.relu(out)
+        #He rescale
+        out = out * math.sqrt(2./ self.input_size)
+
 
         if self.eval_std_dev:
             sd = torch.mean(torch.sqrt(torch.var(out,0)+1e-8))
@@ -397,6 +403,9 @@ class DiscriminatorFactorFC(nn.Module):
             out = torch.cat([out, to_cat], dim=1)
 
         out = self.fc2(out)
+        #He rescale
+        out = out * math.sqrt(2./ self.hidden_size)
+
         out = self.out_nonlinearity(out)
 
         return out
@@ -459,7 +468,9 @@ class DiscriminatorFactorConv(nn.Module):
                                                                       (2 ** (i+1)) * inner_channels_per_layer,
                                                                       4,2,1),
                                                             nn.BatchNorm2d(inner_channels_per_layer * (2 ** (i+1))) if batchnorm else null(),
-                                                            nn.LeakyReLU(.2, inplace=True))
+                                                            nn.LeakyReLU(.2, inplace=True),
+                                                            RescaleAndAddNoise((2 ** (i)) * inner_channels_per_layer,4, 0),
+                                                            )
                                                 for i in range(n_inter_layers)])
 
         n_final_dims = (2 ** n_inter_layers) * inner_channels_per_layer
@@ -484,14 +495,13 @@ class DiscriminatorFactorConv(nn.Module):
         s = h1.size()[2]
         assert s == self.dim_x_y
         # combine lower and upsampled layers into a single block
-        upsampled_h2 = nn.functional.interpolate(h2, size=(s,s), mode='bilinear', align_corners=True)
+        upsampled_h2 = nn.functional.interpolate(h2, size=(s,s), mode='nearest')
 
         x = torch.cat([h1, upsampled_h2], dim=1)
 
         # intermediate layers
         for layer in self.mid_disc_layers:
             x = layer(x)
-            x *= getLayerNormalizationFactor(layer)
 
         # maybe get std dev over batch
         if self.eval_std_dev:
@@ -499,7 +509,7 @@ class DiscriminatorFactorConv(nn.Module):
 
         #last layer
         x = self.last_disc_layer(x)
-        x *= getLayerNormalizationFactor(self.last_disc_layer)
+        x = x*getLayerNormalizationFactor(self.last_disc_layer)
 
         # finally, maybe, apply a sigmoid nonlinearity
         x = self.out_nonlinearity(x)
@@ -565,7 +575,9 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
                                                                       4, 2, 1),
                                                             nn.BatchNorm2d(inner_channels_per_layer * (
                                                             2 ** (i + 1))) if batchnorm else null(),
-                                                            nn.LeakyReLU(.2, inplace=True))
+                                                            nn.LeakyReLU(.2, inplace=True),
+                                                            RescaleAndAddNoise((2 ** (i)) * inner_channels_per_layer,4,0),
+                                                            )
                                               for i in range(n_inter_layers)])
 
         n_final_dims = (2 ** n_inter_layers) * inner_channels_per_layer
@@ -593,14 +605,13 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
         # intermediate layers
         for layer in self.mid_disc_layers:
             x = layer(x)
-            # x *= getLayerNormalizationFactor(layer)
 
         # maybe get std dev over batch
         if self.eval_std_dev:
             x = stdDev(x)
         # last layer
         x = self.last_disc_layer(x)
-        # x *= getLayerNormalizationFactor(self.last_disc_layer)
+        x = x*getLayerNormalizationFactor(self.last_disc_layer)
 
         # finally, maybe, apply a sigmoid nonlinearity
         x = self.out_nonlinearity(x)
@@ -871,7 +882,7 @@ class RescaleAndAddNoise(nn.Module):
     """
     First rescale the outputs of the previous layer based on that layer's He constant. Then,
     add zero-mean Gaussian noise of a given variance if noise_sigma is greater than 0; else do nothing."""
-    def __init__(self, out_channels, kernel, noise_sigma = 0):
+    def __init__(self, in_channels, kernel, noise_sigma = 0, rescale = False):
         super(RescaleAndAddNoise, self).__init__()
 
         if noise_sigma > 0:
@@ -879,11 +890,11 @@ class RescaleAndAddNoise(nn.Module):
         else:
             self.noise_dist = None
 
-        self.weight = math.sqrt(2/(out_channels * kernel**2))
+        self.weight = math.sqrt(2/(in_channels * kernel**2)) if rescale else 1
 
     def forward(self, x):
 
-        x *= self.weight
+        x = x*self.weight
 
         if self.noise_dist is not None:
             noise = self.noise_dist.sample(x.size()).to(x.device).squeeze(dim=-1)
