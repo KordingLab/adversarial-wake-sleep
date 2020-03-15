@@ -882,7 +882,7 @@ class RescaleAndAddNoise(nn.Module):
     """
     First rescale the outputs of the previous layer based on that layer's He constant. Then,
     add zero-mean Gaussian noise of a given variance if noise_sigma is greater than 0; else do nothing."""
-    def __init__(self, in_channels, kernel, noise_sigma = 0, rescale = False):
+    def __init__(self, in_channels, kernel, noise_sigma = 0, rescale = True):
         super(RescaleAndAddNoise, self).__init__()
 
         if noise_sigma > 0:
