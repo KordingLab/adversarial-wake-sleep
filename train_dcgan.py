@@ -124,6 +124,8 @@ parser.add_argument('--divisive-normalization', action='store_true',
 parser.add_argument('--soft-div-norm', default=0, type=float,
                     help='A "soft" divisive normalization over channels, pixel by pixel. A differentiable penalty.' 
                    ' If greater than zero, this is the strength by which the penalty is applied. Default 0.')
+parser.add_argument('--he-initialization', action='store_true',
+                    help='As in ProgressiveGANs. Plays well with divisive normalization')
 
 
 def train(args, cortex, train_loader, discriminator,
@@ -167,9 +169,10 @@ def train(args, cortex, train_loader, discriminator,
         # now update generator with the wake-sleep step
         # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
         # with Gaussian we have log p  = MSE between actual and predicted
-        ML_loss = cortex.generator_surprisal()
+        if args.minimize_generator_surprisal or args.detailed_logging:
+            ML_loss_g = cortex.generator_surprisal()
         if args.minimize_generator_surprisal:
-            ML_loss.backward()
+            ML_loss_g.backward()
 
         # We could update the discriminator here too, if we want.
         # For efficiency I'm putting it later (in the 'sleep') section
@@ -182,7 +185,7 @@ def train(args, cortex, train_loader, discriminator,
 
         if args.soft_div_norm > 0:
             div_norm_loss = cortex.get_pixelwise_channel_norms() * args.soft_div_norm
-            div_norm_loss.backward()
+            div_norm_loss.backward(retain_graph = True)
 
         if args.minimize_inference_surprisal:
             ML_loss = cortex.inference_surprisal()
@@ -378,7 +381,8 @@ def main_worker(gpu, ngpus_per_node, args):
                                     backprop_to_start_inf=bp_thru_inf,
                                     backprop_to_start_gen=bp_thru_gen,
                                     batchnorm = bn,
-                                    normalize = args.divisive_normalization)
+                                    normalize = args.divisive_normalization,
+                                    he_init=args.he_initialization)
 
     discriminator = Discriminator(image_size, cortex.layer_names,
                                   args.noise_dim, args.n_filters, nc,
@@ -387,7 +391,8 @@ def main_worker(gpu, ngpus_per_node, args):
                                   avg_after_n_layers=avg_after_n_layers,
                                   eval_std_dev = args.minibatch_std_dev,
                                   upsample=args.upsample,
-                                  normalize=args.divisive_normalization)
+                                  normalize=args.divisive_normalization,
+                                  he_init=args.he_initialization)
 
     # get to proper GPU
     if args.distributed:

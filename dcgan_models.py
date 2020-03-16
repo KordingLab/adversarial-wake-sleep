@@ -8,7 +8,7 @@ from numpy import prod
 
 class Generator(nn.Module):
     def __init__(self, noise_dim, n_filters, n_img_channels, noise_sigma = 0, backprop_to_start = True,
-                 image_size = 64, batchnorm = False, normalize = False):
+                 image_size = 64, batchnorm = False, normalize = False, he_init = False):
         super(Generator, self).__init__()
         self.noise_dim = noise_dim
         self.n_filters = n_filters
@@ -18,7 +18,7 @@ class Generator(nn.Module):
         self.generative_5to4_conv = nn.Sequential(
             # input is Z, going into a convolution
             nn.ConvTranspose2d(     noise_dim, n_filters * 8, image_size//16, 1, 0 ),
-            RescaleAndAddNoise( n_filters * 8, image_size//16,noise_sigma),
+            RescaleAndAddNoise( n_filters * 8, image_size//16,noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -26,7 +26,7 @@ class Generator(nn.Module):
         self.generative_4to3_conv = nn.Sequential(
             # state size. (n_filters*8) x 4 x 4
             nn.ConvTranspose2d(n_filters * 8, n_filters * 4, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 4, 4, noise_sigma),
+            RescaleAndAddNoise(n_filters * 4, 4, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -34,7 +34,7 @@ class Generator(nn.Module):
         self.generative_3to2_conv = nn.Sequential(
             # state size. (n_filters*4) x 8 x 8
             nn.ConvTranspose2d(n_filters * 4, n_filters * 2, 4, 2, 1 ),
-            RescaleAndAddNoise( n_filters * 2, 4,noise_sigma),
+            RescaleAndAddNoise( n_filters * 2, 4,noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -42,7 +42,7 @@ class Generator(nn.Module):
         self.generative_2to1_conv = nn.Sequential(
             # state size. (n_filters*2) x 16 x 16
             nn.ConvTranspose2d(n_filters * 2,     n_filters, 4, 2, 1 ),
-            RescaleAndAddNoise( n_filters, 4, noise_sigma),
+            RescaleAndAddNoise( n_filters, 4, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -50,7 +50,7 @@ class Generator(nn.Module):
 
         self.generative_1to0_conv = nn.Sequential(
             nn.ConvTranspose2d(    n_filters,      n_img_channels, 4, 2, 1 ),
-            RescaleAndAddNoise(n_img_channels, 4, 0),
+            RescaleAndAddNoise(n_img_channels, 4, 0, rescale=he_init),
             nn.Tanh()
             # state size. (n_img_channels) x 64 x 64
         )
@@ -99,7 +99,7 @@ class Generator(nn.Module):
 
 class Inference(nn.Module):
     def __init__(self, noise_dim, n_filters, n_img_channels, noise_sigma = 0, backprop_to_start = True,
-                 image_size = 64, batchnorm = False, normalize = False):
+                 image_size = 64, batchnorm = False, normalize = False, he_init = False):
         super(Inference, self).__init__()
         self.noise_dim = noise_dim
         self.n_filters = n_filters
@@ -109,33 +109,33 @@ class Inference(nn.Module):
 
         self.inference_4to5_conv = nn.Sequential(
             nn.Conv2d(n_filters * 8, noise_dim, image_size // 16, 1, 0 ),
-            RescaleAndAddNoise( noise_dim, image_size // 16,noise_sigma),
+            RescaleAndAddNoise( noise_dim, image_size // 16,noise_sigma, rescale=he_init),
         )
 
         self.inference_3to4_conv = nn.Sequential(
             nn.Conv2d(n_filters * 4, n_filters * 8, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 8, 4, noise_sigma),
+            RescaleAndAddNoise(n_filters * 8, 4, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
 
         self.inference_2to3_conv = nn.Sequential(
             nn.Conv2d(n_filters * 2, n_filters * 4, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 4, 4, noise_sigma),
+            RescaleAndAddNoise(n_filters * 4, 4, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
 
         self.inference_1to2_conv = nn.Sequential(
             nn.Conv2d(n_filters, n_filters * 2, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 2, 4, noise_sigma),
+            RescaleAndAddNoise(n_filters * 2, 4, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
 
         self.inference_0to1_conv = nn.Sequential(
             nn.Conv2d(n_img_channels, n_filters, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters, 4, noise_sigma),
+            RescaleAndAddNoise(n_filters, 4, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -197,18 +197,24 @@ class DeterministicHelmholtz(nn.Module):
                  backprop_to_start_inf=True,
                  backprop_to_start_gen=True,
                  batchnorm = False,
-                 normalize=False):
+                 normalize=False,
+                 he_init = False):
         super(DeterministicHelmholtz, self).__init__()
 
         assert image_size % 16 == 0
 
         self.inference = Inference(noise_dim, n_filters, n_img_channels, noise_sigma, backprop_to_start_inf, image_size,
-                                   batchnorm=batchnorm, normalize=normalize)
+                                   batchnorm=batchnorm, normalize=normalize, he_init = he_init)
         self.generator = Generator(noise_dim, n_filters, n_img_channels, noise_sigma, backprop_to_start_gen, image_size,
-                                   batchnorm=batchnorm, normalize=normalize)
+                                   batchnorm=batchnorm, normalize=normalize, he_init = he_init)
 
-        self.inference.apply(weights_init)
-        self.generator.apply(weights_init)
+        # init
+        if he_init:
+            self.inference.apply(weights_init_he)
+            self.generator.apply(weights_init_he)
+        else:
+            self.inference.apply(weights_init)
+            self.generator.apply(weights_init)
 
         self.mse = nn.MSELoss()
         self.surprisal_sigma = surprisal_sigma
@@ -354,8 +360,8 @@ class DeterministicHelmholtz(nn.Module):
 
             if self.log_channel_norms:
 
-                self.channel_norms[layer].append(inferred_state_pixel_norm.mean().item(),
-                                                 generated_state_pixel_norm.mean().item())
+                self.channel_norms[layer].append((inferred_state_pixel_norm.mean().item(),
+                                                 generated_state_pixel_norm.mean().item()))
 
         return total_distance_from_1
 
@@ -410,10 +416,12 @@ class null(nn.Module):
 class DiscriminatorFactorFC(nn.Module):
     """To discriminate between two full-connected layers"""
 
-    def __init__(self, input_size, hidden_size, with_sigmoid=False, batchnorm = True, eval_std_dev = False):
+    def __init__(self, input_size, hidden_size, with_sigmoid=False, batchnorm = True, eval_std_dev = False,
+                 he_init = False):
         super(DiscriminatorFactorFC, self).__init__()
         self.hidden_size = hidden_size
         self.input_size = input_size
+        self.he_init = he_init
 
         self.eval_std_dev = eval_std_dev
         self.fc1 = nn.Linear(input_size, hidden_size)
@@ -434,7 +442,8 @@ class DiscriminatorFactorFC(nn.Module):
         out = self.bn(out)
         out = self.relu(out)
         #He rescale
-        out = out * math.sqrt(2./ self.input_size)
+        if self.he_init:
+            out = out * math.sqrt(2./ self.input_size)
 
 
         if self.eval_std_dev:
@@ -444,7 +453,8 @@ class DiscriminatorFactorFC(nn.Module):
 
         out = self.fc2(out)
         #He rescale
-        out = out * math.sqrt(2./ self.hidden_size)
+        if self.he_init:
+            out = out * math.sqrt(2./ self.hidden_size)
 
         out = self.out_nonlinearity(out)
 
@@ -484,8 +494,10 @@ class DiscriminatorFactorConv(nn.Module):
                  with_sigmoid=False,
                  batchnorm = True,
                  normalize = False,
-                 log_channel_norms = False):
+                 log_channel_norms = False,
+                 he_init = False):
         super(DiscriminatorFactorConv, self).__init__()
+        self.he_init = he_init
         assert dim_x_y % 4 == 0
         self.dim_x_y=dim_x_y
         n_inter_layers = 0 if (dim_x_y==4) else int(math.log2(dim_x_y//4))
@@ -511,7 +523,7 @@ class DiscriminatorFactorConv(nn.Module):
                                                                       4,2,1),
                                                             nn.BatchNorm2d(inner_channels_per_layer * (2 ** (i+1))) if batchnorm else null(),
                                                             nn.LeakyReLU(.2, inplace=True),
-                                                            RescaleAndAddNoise((2 ** (i)) * inner_channels_per_layer,4, 0),
+                                                            RescaleAndAddNoise((2 ** (i)) * inner_channels_per_layer,4, 0, rescale = he_init),
                                                             NormalizationLayer() if normalize else null())
                                                 for i in range(n_inter_layers)])
 
@@ -563,7 +575,7 @@ class DiscriminatorFactorConv(nn.Module):
 
         #last layer
         x = self.last_disc_layer(x)
-        x = x*getLayerNormalizationFactor(self.last_disc_layer)
+        x = x * (getLayerNormalizationFactor(self.last_disc_layer) if self.he_init else 1)
 
 
         # finally, maybe, apply a sigmoid nonlinearity
@@ -611,9 +623,11 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
                  with_sigmoid=False,
                  batchnorm=True,
                  normalize =False,
-                 log_channel_norms=False):
+                 log_channel_norms=False,
+                 he_init = False):
 
         super(DiscriminatorFactorConv_noUpsample, self).__init__()
+        self.he_init = he_init
         assert dim_x_y % 4 == 0
         n_inter_layers = 0 if (dim_x_y < 8) else int(math.log2(dim_x_y // 8))
 
@@ -646,7 +660,7 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
                                                             nn.BatchNorm2d(inner_channels_per_layer * (
                                                                 2 ** (i + 1))) if batchnorm else null(),
                                                             nn.LeakyReLU(.2, inplace=True),
-                                                            RescaleAndAddNoise((2 ** (i)) * inner_channels_per_layer,4,0),
+                                                            RescaleAndAddNoise((2 ** (i)) * inner_channels_per_layer,4,0, rescale = he_init),
                                                             NormalizationLayer() if normalize else null())
 
                                               for i in range(n_inter_layers)])
@@ -668,8 +682,8 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
 
     def forward(self, h1, h2):
         # layer 1
-        conved_h1 = self.conv_over_h1(h1) * getLayerNormalizationFactor(self.conv_over_h1)
-        conved_h2 = self.conv_over_h2(h2) * getLayerNormalizationFactor(self.conv_over_h2)
+        conved_h1 = self.conv_over_h1(h1) * (getLayerNormalizationFactor(self.conv_over_h1) if self.he_init else 1)
+        conved_h2 = self.conv_over_h2(h2) * (getLayerNormalizationFactor(self.conv_over_h2) if self.he_init else 1)
         x = torch.cat([conved_h1, conved_h2], dim=1)
         x = self.relu(x)
 
@@ -682,7 +696,7 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
             x = stdDev(x)
         # last layer
         x = self.last_disc_layer(x)
-        x = x*getLayerNormalizationFactor(self.last_disc_layer)
+        x = x * (getLayerNormalizationFactor(self.last_disc_layer) if self.he_init else 1)
 
         # finally, maybe, apply a sigmoid nonlinearity
         x = self.out_nonlinearity(x)
@@ -730,7 +744,8 @@ class Discriminator(nn.Module):
                  eval_std_dev=False,
                  avg_after_n_layers=False,
                  upsample = False,
-                 normalize = False):
+                 normalize = False,
+                 he_init = False):
         super(Discriminator, self).__init__()
 
         self.layer_names = layer_names
@@ -745,7 +760,8 @@ class Discriminator(nn.Module):
                    "eval_std_dev": eval_std_dev,
                    "avg_after_n_layers": avg_after_n_layers,
                    "normalize":normalize,
-                   "log_channel_norms": log_intermediate_Ds}
+                   "log_channel_norms": log_intermediate_Ds,
+                   "he_init":he_init}
 
         if upsample:
             self.discriminator_0and1 = DiscriminatorFactorConv(n_img_channels, n_filters,
@@ -778,7 +794,8 @@ class Discriminator(nn.Module):
                                                           noise_dim*2,
                                                           with_sigmoid,
                                                           batchnorm=batchnorm,
-                                                          eval_std_dev = eval_std_dev)
+                                                          eval_std_dev = eval_std_dev,
+                                                          he_init=he_init)
 
         self.Ds = [self.discriminator_0and1, self.discriminator_1and2,
                    self.discriminator_2and3, self.discriminator_3and4, self.discriminator_4and5]
@@ -786,7 +803,10 @@ class Discriminator(nn.Module):
         self.which_layers = 'all'
 
         # init
-        self.apply(weights_init)
+        if he_init:
+            self.apply(weights_init_he)
+        else:
+            self.apply(weights_init)
 
         # logging
         self.log_intermediate_Ds = log_intermediate_Ds
@@ -795,7 +815,7 @@ class Discriminator(nn.Module):
     def get_total_channel_norm_dist_from_1(self):
         """Gets the total distance from 1 of the pixel-wise norm over channels. """
         total_dist = 0
-        for D in self.Ds:
+        for D in self.Ds[:4]:
             total_dist = total_dist + D.get_channel_norm_dist_from_1()
         return total_dist
 
@@ -944,7 +964,7 @@ def slerp(interp, low, high):
                      torch.sin((1.0-interp)*omega) / so * low + torch.sin(interp*omega) / so * high) #SLERP
     return out
 
-def weights_init(net):
+def weights_init_he(net):
     for m in net.modules():
         if isinstance(m, nn.Conv2d):
             m.weight.data.normal_(0, 1)
@@ -956,6 +976,21 @@ def weights_init(net):
                 m.bias.data.zero_()
         elif isinstance(m, nn.Linear):
             m.weight.data.normal_(0, 1)
+            if m.bias is not None:
+                m.bias.data.zero_()
+
+def weights_init(net):
+    for m in net.modules():
+        if isinstance(m, nn.Conv2d):
+            m.weight.data.normal_(0, 0.02)
+            if m.bias is not None:
+                m.bias.data.zero_()
+        elif isinstance(m, nn.ConvTranspose2d):
+            m.weight.data.normal_(0, 0.02)
+            if m.bias is not None:
+                m.bias.data.zero_()
+        elif isinstance(m, nn.Linear):
+            m.weight.data.normal_(0, 0.02)
             if m.bias is not None:
                 m.bias.data.zero_()
 
