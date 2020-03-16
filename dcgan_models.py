@@ -17,8 +17,8 @@ class Generator(nn.Module):
 
         self.generative_5to4_conv = nn.Sequential(
             # input is Z, going into a convolution
-            nn.ConvTranspose2d(     noise_dim, n_filters * 8, image_size//16, 1, 0 ),
-            RescaleAndAddNoise( n_filters * 8, image_size//16,noise_sigma, rescale=he_init),
+            nn.ConvTranspose2d(noise_dim, n_filters * 8, image_size//16, 1, 0 ),
+            RescaleAndAddNoise(noise_dim, image_size//16,noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -26,7 +26,7 @@ class Generator(nn.Module):
         self.generative_4to3_conv = nn.Sequential(
             # state size. (n_filters*8) x 4 x 4
             nn.ConvTranspose2d(n_filters * 8, n_filters * 4, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 4, 4, noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(n_filters * 8, 4, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -34,23 +34,23 @@ class Generator(nn.Module):
         self.generative_3to2_conv = nn.Sequential(
             # state size. (n_filters*4) x 8 x 8
             nn.ConvTranspose2d(n_filters * 4, n_filters * 2, 4, 2, 1 ),
-            RescaleAndAddNoise( n_filters * 2, 4,noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(n_filters * 4, 4,noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
 
         self.generative_2to1_conv = nn.Sequential(
             # state size. (n_filters*2) x 16 x 16
-            nn.ConvTranspose2d(n_filters * 2,     n_filters, 4, 2, 1 ),
-            RescaleAndAddNoise( n_filters, 4, noise_sigma, rescale=he_init),
+            nn.ConvTranspose2d(n_filters * 2, n_filters, 4, 2, 1 ),
+            RescaleAndAddNoise(n_filters * 2, 4, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
             # state size. (n_filters) x 32 x 32
 
         self.generative_1to0_conv = nn.Sequential(
-            nn.ConvTranspose2d(    n_filters,      n_img_channels, 4, 2, 1 ),
-            RescaleAndAddNoise(n_img_channels, 4, 0, rescale=he_init),
+            nn.ConvTranspose2d(n_filters, n_img_channels, 4, 2, 1 ),
+            RescaleAndAddNoise(n_filters, 4, 0, rescale=he_init),
             nn.Tanh()
             # state size. (n_img_channels) x 64 x 64
         )
@@ -109,33 +109,33 @@ class Inference(nn.Module):
 
         self.inference_4to5_conv = nn.Sequential(
             nn.Conv2d(n_filters * 8, noise_dim, image_size // 16, 1, 0 ),
-            RescaleAndAddNoise( noise_dim, image_size // 16,noise_sigma, rescale=he_init),
+            RescaleAndAddNoise( n_filters * 8, image_size // 16,noise_sigma, rescale=he_init),
         )
 
         self.inference_3to4_conv = nn.Sequential(
             nn.Conv2d(n_filters * 4, n_filters * 8, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 8, 4, noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(n_filters * 4, 4, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
 
         self.inference_2to3_conv = nn.Sequential(
             nn.Conv2d(n_filters * 2, n_filters * 4, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 4, 4, noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(n_filters * 2, 4, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
 
         self.inference_1to2_conv = nn.Sequential(
             nn.Conv2d(n_filters, n_filters * 2, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 2, 4, noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(n_filters, 4, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
 
         self.inference_0to1_conv = nn.Sequential(
             nn.Conv2d(n_img_channels, n_filters, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters, 4, noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(n_img_channels, 4, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -346,7 +346,7 @@ class DeterministicHelmholtz(nn.Module):
         for i, layer in enumerate(self.layer_names):
 
             inferred_state = self.inference.intermediate_state_dict[layer]
-            generated_state = self.inference.intermediate_state_dict[layer]
+            generated_state = self.generator.intermediate_state_dict[layer]
 
             inferred_state_pixel_norm = (((inferred_state**2).mean(dim=1) + epsilon).sqrt())
             inferred_state_pixel_norm_dist_from_1 = self.mse(inferred_state_pixel_norm,
@@ -521,9 +521,10 @@ class DiscriminatorFactorConv(nn.Module):
         self.mid_disc_layers = nn.ModuleList([nn.Sequential(nn.Conv2d((2 ** i) * inner_channels_per_layer,
                                                                       (2 ** (i+1)) * inner_channels_per_layer,
                                                                       4,2,1),
+                                                            RescaleAndAddNoise((2 ** i) * inner_channels_per_layer, 4,
+                                                                               0, rescale=he_init),
                                                             nn.BatchNorm2d(inner_channels_per_layer * (2 ** (i+1))) if batchnorm else null(),
                                                             nn.LeakyReLU(.2, inplace=True),
-                                                            RescaleAndAddNoise((2 ** (i)) * inner_channels_per_layer,4, 0, rescale = he_init),
                                                             NormalizationLayer() if normalize else null())
                                                 for i in range(n_inter_layers)])
 
@@ -657,10 +658,11 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
         self.mid_disc_layers = nn.ModuleList([nn.Sequential(nn.Conv2d((2 ** i) * inner_channels_per_layer,
                                                                       (2 ** (i + 1)) * inner_channels_per_layer,
                                                                       4, 2, 1),
+                                                            RescaleAndAddNoise((2 ** (i)) * inner_channels_per_layer, 4,
+                                                                               0, rescale=he_init),
                                                             nn.BatchNorm2d(inner_channels_per_layer * (
                                                                 2 ** (i + 1))) if batchnorm else null(),
                                                             nn.LeakyReLU(.2, inplace=True),
-                                                            RescaleAndAddNoise((2 ** (i)) * inner_channels_per_layer,4,0, rescale = he_init),
                                                             NormalizationLayer() if normalize else null())
 
                                               for i in range(n_inter_layers)])
@@ -818,6 +820,9 @@ class Discriminator(nn.Module):
         for D in self.Ds[:4]:
             total_dist = total_dist + D.get_channel_norm_dist_from_1()
         return total_dist
+
+    def get_channel_norms(self):
+        return {i: D.channel_norms for i, D in enumerate(self.Ds[:4])}
 
     def forward(self, network_state_dict):
         """

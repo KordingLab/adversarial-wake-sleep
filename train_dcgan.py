@@ -170,9 +170,9 @@ def train(args, cortex, train_loader, discriminator,
         # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
         # with Gaussian we have log p  = MSE between actual and predicted
         if args.minimize_generator_surprisal or args.detailed_logging:
-            ML_loss_g = cortex.generator_surprisal()
+            ML_loss = cortex.generator_surprisal()
         if args.minimize_generator_surprisal:
-            ML_loss_g.backward()
+            ML_loss.backward()
 
         # We could update the discriminator here too, if we want.
         # For efficiency I'm putting it later (in the 'sleep') section
@@ -504,7 +504,9 @@ def main_worker(gpu, ngpus_per_node, args):
                 'train_history': {"disc_loss" : discriminator.intermediate_Ds,
                                   "surprisals": cortex.intermediate_surprisals,
                                   "reconstructions": cortex.intermediate_reconstructions,
-                                  "weight_alignment": cortex.weight_alignment}
+                                  "weight_alignment": cortex.weight_alignment,
+                                  "cortex_channel_magnitudes": cortex.channel_norms,
+                                  "discriminator_channel_magnitudes": discriminator.get_channel_norms()}
             }, 'checkpoint.pth.tar')
 
 if __name__ == '__main__':
