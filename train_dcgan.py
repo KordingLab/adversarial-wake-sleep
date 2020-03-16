@@ -121,10 +121,13 @@ parser.add_argument('--upsample', action='store_true',
                     ' upsample h2 and convolve separately.')
 parser.add_argument('--divisive-normalization', action='store_true',
                     help='Divisive normalization over channels, pixel by pixel. As in ProgressiveGANs')
+parser.add_argument('--soft-div-norm', default=0, type=float,
+                    help='A "soft" divisive normalization over channels, pixel by pixel. A differentiable penalty.' 
+                   ' If greater than zero, this is the strength by which the penalty is applied. Default 0.')
 
 
 def train(args, cortex, train_loader, discriminator,
-              optimizerD, optimizerG, optimizerF, epoch, ml_after_epoch = -1):
+              optimizerD, optimizerG, optimizerF, epoch):
 
     noise_layer = len(cortex.generator.listed_modules)
 
@@ -177,6 +180,10 @@ def train(args, cortex, train_loader, discriminator,
 
         generated_input = cortex.noise_and_generate(noise_layer)
 
+        if args.soft_div_norm > 0:
+            div_norm_loss = cortex.get_pixelwise_channel_norms() * args.soft_div_norm
+            div_norm_loss.backward()
+
         if args.minimize_inference_surprisal:
             ML_loss = cortex.inference_surprisal()
             ML_loss.backward()
@@ -220,6 +227,9 @@ def train(args, cortex, train_loader, discriminator,
 
         if args.historical_averaging > 0:
             disc_loss = disc_loss + ha_loss(discriminator)
+
+        if args.soft_div_norm > 0:
+            disc_loss = disc_loss + args.soft_div_norm * discriminator.get_total_channel_norm_dist_from_1()
 
         # now update the inference and generator to fight the discriminator
 
@@ -364,9 +374,7 @@ def main_worker(gpu, ngpus_per_node, args):
     cortex = DeterministicHelmholtz(args.noise_dim, args.n_filters, nc,
                                     image_size=image_size,
                                     surprisal_sigma=args.surprisal_sigma,
-                                    log_intermediate_surprisals=args.detailed_logging,
-                                    log_intermediate_reconstructions=args.detailed_logging,
-                                    log_weight_alignment=args.detailed_logging,
+                                    detailed_logging=args.detailed_logging,
                                     backprop_to_start_inf=bp_thru_inf,
                                     backprop_to_start_gen=bp_thru_gen,
                                     batchnorm = bn,
@@ -378,7 +386,8 @@ def main_worker(gpu, ngpus_per_node, args):
                                   log_intermediate_Ds=args.detailed_logging,
                                   avg_after_n_layers=avg_after_n_layers,
                                   eval_std_dev = args.minibatch_std_dev,
-                                  upsample=args.upsample)
+                                  upsample=args.upsample,
+                                  normalize=args.divisive_normalization)
 
     # get to proper GPU
     if args.distributed:
@@ -459,14 +468,12 @@ def main_worker(gpu, ngpus_per_node, args):
         args.start_epoch = 0
 
     for epoch in range(args.start_epoch, args.epochs):
-        e = -1 if args.minimize_generator_surprisal else epoch + 1
 
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
         train(args, cortex, train_loader, discriminator,
-              optimizerD, optimizerG, optimizerF, epoch,
-              ml_after_epoch = e)
+              optimizerD, optimizerG, optimizerF, epoch)
 
 
         if args.save_imgs:

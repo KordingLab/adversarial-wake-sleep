@@ -193,9 +193,7 @@ class DeterministicHelmholtz(nn.Module):
                  image_size = 64,
                  surprisal_sigma=1.0,
                  noise_sigma = 0,
-                 log_intermediate_surprisals=False,
-                 log_intermediate_reconstructions=False,
-                 log_weight_alignment=False,
+                 detailed_logging = True,
                  backprop_to_start_inf=True,
                  backprop_to_start_gen=True,
                  batchnorm = False,
@@ -220,14 +218,17 @@ class DeterministicHelmholtz(nn.Module):
         self.noise_dist = Normal(torch.tensor([0.0]), torch.tensor([1.0]))
 
         # logging
-        self.log_intermediate_surprisals = log_intermediate_surprisals
+        self.log_intermediate_surprisals = detailed_logging
         self.intermediate_surprisals = {layer: [] for layer in self.layer_names}
 
-        self.log_intermediate_reconstructions = log_intermediate_reconstructions
+        self.log_intermediate_reconstructions = detailed_logging
         self.intermediate_reconstructions = {layer: [] for layer in self.layer_names}
 
-        self.log_weight_alignment_ = log_weight_alignment
+        self.log_weight_alignment_ = detailed_logging
         self.weight_alignment = {layer: [] for layer in self.layer_names}
+
+        self.log_channel_norms = detailed_logging
+        self.channel_norms = {layer: [] for layer in self.layer_names}
 
 
     def infer(self, x):
@@ -319,6 +320,45 @@ class DeterministicHelmholtz(nn.Module):
 
         return ML_loss
 
+    def get_pixelwise_channel_norms(self):
+        """This can be used to implement a 'soft' divisive normalization (where the 'hard' version is
+        that which is implemented in Karras et al.). It can also be used for logging & debugging.
+
+        Logs the total value by layer as a tuple (inferred norm, generated norm)
+
+        Returns the pixel-wise distance from 0 (as a cost) to be minimized)"""
+
+        if self.inference.intermediate_state_dict['Input'] is None:
+            raise AssertionError("Inference must be run first before calculating this.")
+        if self.generator.intermediate_state_dict['Input'] is None:
+            raise AssertionError("Inference must be run first before calculating this.")
+
+        epsilon = 1e-8
+
+        total_distance_from_1 = 0
+
+        for i, layer in enumerate(self.layer_names):
+
+            inferred_state = self.inference.intermediate_state_dict[layer]
+            generated_state = self.inference.intermediate_state_dict[layer]
+
+            inferred_state_pixel_norm = (((inferred_state**2).mean(dim=1) + epsilon).sqrt())
+            inferred_state_pixel_norm_dist_from_1 = self.mse(inferred_state_pixel_norm,
+                                                             torch.ones_like(inferred_state_pixel_norm))
+            total_distance_from_1 = inferred_state_pixel_norm_dist_from_1 + total_distance_from_1
+
+            generated_state_pixel_norm = (((generated_state**2).mean(dim=1) + epsilon).sqrt())
+            generated_state_pixel_norm_dist_from_1 = self.mse(generated_state_pixel_norm,
+                                                             torch.ones_like(generated_state_pixel_norm))
+            total_distance_from_1 = generated_state_pixel_norm_dist_from_1 + total_distance_from_1
+
+            if self.log_channel_norms:
+
+                self.channel_norms[layer].append(inferred_state_pixel_norm.mean().item(),
+                                                 generated_state_pixel_norm.mean().item())
+
+        return total_distance_from_1
+
 
     def log_layerwise_reconstructions(self):
         """From the current *inferential* distribution, determine (and record?) the
@@ -393,6 +433,8 @@ class DiscriminatorFactorFC(nn.Module):
         out = self.fc1(x)
         out = self.bn(out)
         out = self.relu(out)
+        #He rescale
+        out = out * math.sqrt(2./ self.input_size)
 
 
         if self.eval_std_dev:
@@ -401,6 +443,8 @@ class DiscriminatorFactorFC(nn.Module):
             out = torch.cat([out, to_cat], dim=1)
 
         out = self.fc2(out)
+        #He rescale
+        out = out * math.sqrt(2./ self.hidden_size)
 
         out = self.out_nonlinearity(out)
 
@@ -438,7 +482,9 @@ class DiscriminatorFactorConv(nn.Module):
                  dim_x_y,
                  avg_after_n_layers = False, eval_std_dev = False,
                  with_sigmoid=False,
-                 batchnorm = True):
+                 batchnorm = True,
+                 normalize = False,
+                 log_channel_norms = False):
         super(DiscriminatorFactorConv, self).__init__()
         assert dim_x_y % 4 == 0
         self.dim_x_y=dim_x_y
@@ -466,7 +512,7 @@ class DiscriminatorFactorConv(nn.Module):
                                                             nn.BatchNorm2d(inner_channels_per_layer * (2 ** (i+1))) if batchnorm else null(),
                                                             nn.LeakyReLU(.2, inplace=True),
                                                             RescaleAndAddNoise((2 ** (i)) * inner_channels_per_layer,4, 0),
-                                                            )
+                                                            NormalizationLayer() if normalize else null())
                                                 for i in range(n_inter_layers)])
 
         n_final_dims = (2 ** n_inter_layers) * inner_channels_per_layer
@@ -486,6 +532,13 @@ class DiscriminatorFactorConv(nn.Module):
 
         self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null()
 
+        self.log_channel_norms = log_channel_norms
+        if log_channel_norms:
+            self.channel_norms = {layer: [] for layer in range(n_inter_layers)}
+            self.current_channel_norms = {}
+            self.mse = nn.MSELoss()
+
+
     def forward(self, h1, h2):
         #size check
         s = h1.size()[2]
@@ -496,8 +549,13 @@ class DiscriminatorFactorConv(nn.Module):
         x = torch.cat([h1, upsampled_h2], dim=1)
 
         # intermediate layers
-        for layer in self.mid_disc_layers:
+        for i, layer in enumerate(self.mid_disc_layers):
             x = layer(x)
+
+            if self.log_channel_norms:
+                n = self.get_channel_norm(x)
+                self.current_channel_norms[i] = n
+                self.channel_norms[i].append(n.mean().item())
 
         # maybe get std dev over batch
         if self.eval_std_dev:
@@ -505,6 +563,8 @@ class DiscriminatorFactorConv(nn.Module):
 
         #last layer
         x = self.last_disc_layer(x)
+        x = x*getLayerNormalizationFactor(self.last_disc_layer)
+
 
         # finally, maybe, apply a sigmoid nonlinearity
         x = self.out_nonlinearity(x)
@@ -513,6 +573,17 @@ class DiscriminatorFactorConv(nn.Module):
             x = x.mean(dim=3).mean(dim=2)
 
         return x
+
+    def get_channel_norm(self, x):
+        return (((x**2).mean(dim=1) + 1e-8).sqrt())
+
+    def get_channel_norm_dist_from_1(self):
+        total_dist = 0
+        for layer, state in self.current_channel_norms.items():
+            total_dist = total_dist + self.mse(state, torch.ones_like(state))
+        return total_dist
+
+
 
 class DiscriminatorFactorConv_noUpsample(nn.Module):
     """To discriminate between two layers separated by a convolutional operation.
@@ -538,7 +609,10 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
                  dim_x_y,
                  avg_after_n_layers=False, eval_std_dev=False,
                  with_sigmoid=False,
-                 batchnorm=True):
+                 batchnorm=True,
+                 normalize =False,
+                 log_channel_norms=False):
+
         super(DiscriminatorFactorConv_noUpsample, self).__init__()
         assert dim_x_y % 4 == 0
         n_inter_layers = 0 if (dim_x_y < 8) else int(math.log2(dim_x_y // 8))
@@ -561,6 +635,7 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
         self.conv_over_h2 = nn.Conv2d(h2_channels, h2_channels,
                                       conv_kernel - 1, 1, int((conv_kernel) / 4))
         self.relu = nn.LeakyReLU(.2, inplace=True)
+        self.normalize = NormalizationLayer() if normalize else null()
 
         ## Then we pare down this combined hidden state to a logit
         # The last layer is always kernel=4, stride = 0
@@ -569,10 +644,11 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
                                                                       (2 ** (i + 1)) * inner_channels_per_layer,
                                                                       4, 2, 1),
                                                             nn.BatchNorm2d(inner_channels_per_layer * (
-                                                            2 ** (i + 1))) if batchnorm else null(),
+                                                                2 ** (i + 1))) if batchnorm else null(),
                                                             nn.LeakyReLU(.2, inplace=True),
                                                             RescaleAndAddNoise((2 ** (i)) * inner_channels_per_layer,4,0),
-                                                            )
+                                                            NormalizationLayer() if normalize else null())
+
                                               for i in range(n_inter_layers)])
 
         n_final_dims = (2 ** n_inter_layers) * inner_channels_per_layer
@@ -592,8 +668,8 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
 
     def forward(self, h1, h2):
         # layer 1
-        conved_h1 = self.conv_over_h1(h1)
-        conved_h2 = self.conv_over_h2(h2)
+        conved_h1 = self.conv_over_h1(h1) * getLayerNormalizationFactor(self.conv_over_h1)
+        conved_h2 = self.conv_over_h2(h2) * getLayerNormalizationFactor(self.conv_over_h2)
         x = torch.cat([conved_h1, conved_h2], dim=1)
         x = self.relu(x)
 
@@ -606,6 +682,7 @@ class DiscriminatorFactorConv_noUpsample(nn.Module):
             x = stdDev(x)
         # last layer
         x = self.last_disc_layer(x)
+        x = x*getLayerNormalizationFactor(self.last_disc_layer)
 
         # finally, maybe, apply a sigmoid nonlinearity
         x = self.out_nonlinearity(x)
@@ -652,7 +729,8 @@ class Discriminator(nn.Module):
                  log_intermediate_Ds=False,
                  eval_std_dev=False,
                  avg_after_n_layers=False,
-                 upsample = False):
+                 upsample = False,
+                 normalize = False):
         super(Discriminator, self).__init__()
 
         self.layer_names = layer_names
@@ -665,7 +743,9 @@ class Discriminator(nn.Module):
         kw_args = {"with_sigmoid": with_sigmoid,
                    "batchnorm": batchnorm,
                    "eval_std_dev": eval_std_dev,
-                   "avg_after_n_layers": avg_after_n_layers}
+                   "avg_after_n_layers": avg_after_n_layers,
+                   "normalize":normalize,
+                   "log_channel_norms": log_intermediate_Ds}
 
         if upsample:
             self.discriminator_0and1 = DiscriminatorFactorConv(n_img_channels, n_filters,
@@ -711,6 +791,13 @@ class Discriminator(nn.Module):
         # logging
         self.log_intermediate_Ds = log_intermediate_Ds
         self.intermediate_Ds = {layer: [] for layer in self.layer_names}
+
+    def get_total_channel_norm_dist_from_1(self):
+        """Gets the total distance from 1 of the pixel-wise norm over channels. """
+        total_dist = 0
+        for D in self.Ds:
+            total_dist = total_dist + D.get_channel_norm_dist_from_1()
+        return total_dist
 
     def forward(self, network_state_dict):
         """
@@ -860,15 +947,15 @@ def slerp(interp, low, high):
 def weights_init(net):
     for m in net.modules():
         if isinstance(m, nn.Conv2d):
-            m.weight.data.normal_(0, .02)
+            m.weight.data.normal_(0, 1)
             if m.bias is not None:
                 m.bias.data.zero_()
         elif isinstance(m, nn.ConvTranspose2d):
-            m.weight.data.normal_(0, 0.02)
+            m.weight.data.normal_(0, 1)
             if m.bias is not None:
                 m.bias.data.zero_()
         elif isinstance(m, nn.Linear):
-            m.weight.data.normal_(0, 0.02)
+            m.weight.data.normal_(0, 1)
             if m.bias is not None:
                 m.bias.data.zero_()
 
@@ -876,7 +963,7 @@ class RescaleAndAddNoise(nn.Module):
     """
     First rescale the outputs of the previous layer based on that layer's He constant. Then,
     add zero-mean Gaussian noise of a given variance if noise_sigma is greater than 0; else do nothing."""
-    def __init__(self, in_channels, kernel, noise_sigma = 0, rescale = False):
+    def __init__(self, in_channels, kernel, noise_sigma = 0, rescale = True):
         super(RescaleAndAddNoise, self).__init__()
 
         if noise_sigma > 0:
