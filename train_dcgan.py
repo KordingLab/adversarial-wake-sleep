@@ -104,10 +104,6 @@ parser.add_argument('--label-smoothing', action='store_true',
                     help='Make the discriminator be less confident by randomly switching labels with p=.1')
 parser.add_argument('--historical-averaging',  default=0, type=float,
                     help='Make the discriminator move a little more slowly. Used if value > 0')
-
-parser.add_argument('--sequential-training', action='store_true',
-                    help='Train the first layer to completion, then add on the other ones. '
-                    'Noise in injected at the top of the layer being trained (as the prior). Other layers are frozen.')
 parser.add_argument('--minibatch-std-dev', action='store_true',
                     help='Evaluate the standard deviation of the features in the 2nd-to-last layer of the discriminator'
                     ' and add it as a feature. As in progressiveGAN.')
@@ -116,9 +112,6 @@ parser.add_argument('--avg-after-n-layers', default=0, type=int,
                             x and y dimensions to 1, just average over the x and y channels instead of continuing
                             to convolve down. Designed to prevent lower-layer discriminators from learning to
                             discriminate global image structure. Not used if set to False.""")
-parser.add_argument('--upsample', action='store_true',
-                    help='Instead of applying a conv2d to h1 and h2 separate before combining,'
-                    ' upsample h2 and convolve separately.')
 parser.add_argument('--divisive-normalization', action='store_true',
                     help='Divisive normalization over channels, pixel by pixel. As in ProgressiveGANs')
 parser.add_argument('--soft-div-norm', default=0, type=float,
@@ -390,7 +383,6 @@ def main_worker(gpu, ngpus_per_node, args):
                                   log_intermediate_Ds=args.detailed_logging,
                                   avg_after_n_layers=avg_after_n_layers,
                                   eval_std_dev = args.minibatch_std_dev,
-                                  upsample=args.upsample,
                                   normalize=args.divisive_normalization,
                                   he_init=args.he_initialization)
 

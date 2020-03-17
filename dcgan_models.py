@@ -15,10 +15,15 @@ class Generator(nn.Module):
         self.n_img_channels = n_img_channels
         self.backprop_to_start = backprop_to_start
 
+        # Regarding he initialization:
+        # An interesting thing with the ConvTranspose is that the number of effective inputs is not
+        # kernel_size ** 2 * in_channels, but rather depends on the stride and size (due to expansion
+        # of the inputs and convolving with padding; both implicitly apply 0s)
+
         self.generative_5to4_conv = nn.Sequential(
             # input is Z, going into a convolution
             nn.ConvTranspose2d(noise_dim, n_filters * 8, image_size//16, 1, 0 ),
-            RescaleAndAddNoise(noise_dim, image_size//16,noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(noise_dim, 1 ,noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -26,7 +31,7 @@ class Generator(nn.Module):
         self.generative_4to3_conv = nn.Sequential(
             # state size. (n_filters*8) x 4 x 4
             nn.ConvTranspose2d(n_filters * 8, n_filters * 4, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 8, 4, noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(n_filters * 8, 2, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -34,7 +39,7 @@ class Generator(nn.Module):
         self.generative_3to2_conv = nn.Sequential(
             # state size. (n_filters*4) x 8 x 8
             nn.ConvTranspose2d(n_filters * 4, n_filters * 2, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 4, 4,noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(n_filters * 4, 2,noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -42,7 +47,7 @@ class Generator(nn.Module):
         self.generative_2to1_conv = nn.Sequential(
             # state size. (n_filters*2) x 16 x 16
             nn.ConvTranspose2d(n_filters * 2, n_filters, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 2, 4, noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(n_filters * 2, 2, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -50,7 +55,7 @@ class Generator(nn.Module):
 
         self.generative_1to0_conv = nn.Sequential(
             nn.ConvTranspose2d(n_filters, n_img_channels, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters, 4, 0, rescale=he_init),
+            RescaleAndAddNoise(n_filters, 2, 0, rescale=he_init),
             nn.Tanh()
             # state size. (n_img_channels) x 64 x 64
         )
@@ -209,12 +214,8 @@ class DeterministicHelmholtz(nn.Module):
                                    batchnorm=batchnorm, normalize=normalize, he_init = he_init)
 
         # init
-        if he_init:
-            self.inference.apply(weights_init_he)
-            self.generator.apply(weights_init_he)
-        else:
-            self.inference.apply(weights_init)
-            self.generator.apply(weights_init)
+        self.inference.apply(weights_init)
+        self.generator.apply(weights_init)
 
         self.mse = nn.MSELoss()
         self.surprisal_sigma = surprisal_sigma
@@ -597,117 +598,6 @@ class DiscriminatorFactorConv(nn.Module):
         return total_dist
 
 
-
-class DiscriminatorFactorConv_noUpsample(nn.Module):
-    """To discriminate between two layers separated by a convolutional operation.
-    This module programatically generates a multilayer convolutional network with N layers. Since each layer
-    halves the x and y dimension, the number of layers N is log2( dim_x_y ). For this reason
-    the dimension must be supplied when constructing.
-    INPUTS
-    [conv_kernel, conv_stride, conv_pad] = the parameters of the Conv2d in the inference operation between
-    the two layers (or equivalently the ConvTranspose2d of the generator)
-    inner_channels_per_layer: how many hidden dimension channels (doubles as you go up the disc).
-    dim_x_y: Size of the square array in the *bottom* layer. Must be divisible by 4.
-    with_sigmoid = Boolean. Whether to apply a sigmoid to the output of each inner Discriminator, as required when
-                        averaging (ensembling) multiple discriminators in a standard GAN with BCELoss
-    avg_after_n_layers = Int > 1 (or False): convolve this many layers and, if this many layers doesn't shrink the
-                            x and y dimensions to 1, just average over the x and y channels instead of continuing
-                            to convolve down. Designed to prevent lower-layer discriminators from learning to
-                            discriminate global image structure. Not used if set to False.
-    eval_std_dev: Boolean. Calculate the std deviation of the 2nd-to-last layer(the pre-logit)  in this disciminator,
-                            and use that for the decision.
-    """
-
-    def __init__(self, h1_channels, h2_channels,
-                 dim_x_y,
-                 avg_after_n_layers=False, eval_std_dev=False,
-                 with_sigmoid=False,
-                 batchnorm=True,
-                 normalize =False,
-                 log_channel_norms=False,
-                 he_init = False):
-
-        super(DiscriminatorFactorConv_noUpsample, self).__init__()
-        self.he_init = he_init
-        assert dim_x_y % 4 == 0
-        n_inter_layers = 0 if (dim_x_y < 8) else int(math.log2(dim_x_y // 8))
-
-        # handle the averaging operation
-        self.avg_after_n_layers = avg_after_n_layers
-        if avg_after_n_layers is not False:
-            assert avg_after_n_layers > 1
-            n_inter_layers = min(n_inter_layers, avg_after_n_layers - 2)
-
-        inner_channels_per_layer = (h1_channels+h2_channels)
-        conv_kernel, conv_stride, conv_pad = 4, 2, 1
-
-        ## Layer 1 combines the two layers of the inference/generator network into 1
-        self.conv_over_h1 = nn.Conv2d(h1_channels, h1_channels,
-                                      conv_kernel, conv_stride, conv_pad)
-
-        # the result of the upper conv must have the same 2d size as the lower conv
-        # (even though the original layer sizes will be different)
-        self.conv_over_h2 = nn.Conv2d(h2_channels, h2_channels,
-                                      conv_kernel - 1, 1, int((conv_kernel) / 4))
-        self.relu = nn.LeakyReLU(.2, inplace=True)
-        self.normalize = NormalizationLayer() if normalize else null()
-
-        ## Then we pare down this combined hidden state to a logit
-        # The last layer is always kernel=4, stride = 0
-        # we intersperse a number of dimesion-halving layers in between depending on the original size
-        self.mid_disc_layers = nn.ModuleList([nn.Sequential(nn.Conv2d((2 ** i) * inner_channels_per_layer,
-                                                                      (2 ** (i + 1)) * inner_channels_per_layer,
-                                                                      4, 2, 1),
-                                                            RescaleAndAddNoise((2 ** (i)) * inner_channels_per_layer, 4,
-                                                                               0, rescale=he_init),
-                                                            nn.BatchNorm2d(inner_channels_per_layer * (
-                                                                2 ** (i + 1))) if batchnorm else null(),
-                                                            nn.LeakyReLU(.2, inplace=True),
-                                                            NormalizationLayer() if normalize else null())
-
-                                              for i in range(n_inter_layers)])
-
-        n_final_dims = (2 ** n_inter_layers) * inner_channels_per_layer
-        self.eval_std_dev = eval_std_dev
-        if eval_std_dev:
-            n_final_dims += 1
-
-        #if we're averaging over many decisions of a convolved sub-discriminator,
-        # that is if the n_inter_layers was greater than the number of layers before averaging,
-        # we want the kernel to be 1. else it's 4.
-        if n_inter_layers > avg_after_n_layers-2:
-            self.last_disc_layer = nn.Conv2d(n_final_dims, 1, dim_x_y//2 if dim_x_y<8 else 4, 1, 0)
-        else:
-            self.last_disc_layer = nn.Conv2d(n_final_dims, 1, 1, 1, 0)
-
-        self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null()
-
-    def forward(self, h1, h2):
-        # layer 1
-        conved_h1 = self.conv_over_h1(h1) * (getLayerNormalizationFactor(self.conv_over_h1) if self.he_init else 1)
-        conved_h2 = self.conv_over_h2(h2) * (getLayerNormalizationFactor(self.conv_over_h2) if self.he_init else 1)
-        x = torch.cat([conved_h1, conved_h2], dim=1)
-        x = self.relu(x)
-
-        # intermediate layers
-        for layer in self.mid_disc_layers:
-            x = layer(x)
-
-        # maybe get std dev over batch
-        if self.eval_std_dev:
-            x = stdDev(x)
-        # last layer
-        x = self.last_disc_layer(x)
-        x = x * (getLayerNormalizationFactor(self.last_disc_layer) if self.he_init else 1)
-
-        # finally, maybe, apply a sigmoid nonlinearity
-        x = self.out_nonlinearity(x)
-
-        if self.avg_after_n_layers:
-            x = x.mean(dim=3).mean(dim=2)
-
-        return x
-
 def stdDev(x):
     r"""
     Add a standard deviation channel to the current layer.
@@ -745,7 +635,6 @@ class Discriminator(nn.Module):
                  log_intermediate_Ds=False,
                  eval_std_dev=False,
                  avg_after_n_layers=False,
-                 upsample = False,
                  normalize = False,
                  he_init = False):
         super(Discriminator, self).__init__()
@@ -765,32 +654,18 @@ class Discriminator(nn.Module):
                    "log_channel_norms": log_intermediate_Ds,
                    "he_init":he_init}
 
-        if upsample:
-            self.discriminator_0and1 = DiscriminatorFactorConv(n_img_channels, n_filters,
-                                                               dim_x_y=image_size,
-                                                               **kw_args)
-            self.discriminator_1and2 = DiscriminatorFactorConv(n_filters, n_filters * 2,
-                                                               dim_x_y=image_size//2,
-                                                               **kw_args)
-            self.discriminator_2and3 = DiscriminatorFactorConv(n_filters * 2, n_filters * 4,
-                                                               dim_x_y=image_size//4,
-                                                               **kw_args)
-            self.discriminator_3and4 = DiscriminatorFactorConv(n_filters * 4, n_filters * 8,
-                                                               dim_x_y=image_size//8,
-                                                               **kw_args)
-        else:
-            self.discriminator_0and1 = DiscriminatorFactorConv_noUpsample(n_img_channels, n_filters,
-                                                               dim_x_y=image_size,
-                                                               **kw_args)
-            self.discriminator_1and2 = DiscriminatorFactorConv_noUpsample(n_filters, n_filters * 2,
-                                                               dim_x_y=image_size//2,
-                                                               **kw_args)
-            self.discriminator_2and3 = DiscriminatorFactorConv_noUpsample(n_filters * 2, n_filters * 4,
-                                                               dim_x_y=image_size//4,
-                                                               **kw_args)
-            self.discriminator_3and4 = DiscriminatorFactorConv_noUpsample(n_filters * 4, n_filters * 8,
-                                                               dim_x_y=image_size//8,
-                                                               **kw_args)
+        self.discriminator_0and1 = DiscriminatorFactorConv(n_img_channels, n_filters,
+                                                           dim_x_y=image_size,
+                                                           **kw_args)
+        self.discriminator_1and2 = DiscriminatorFactorConv(n_filters, n_filters * 2,
+                                                           dim_x_y=image_size//2,
+                                                           **kw_args)
+        self.discriminator_2and3 = DiscriminatorFactorConv(n_filters * 2, n_filters * 4,
+                                                           dim_x_y=image_size//4,
+                                                           **kw_args)
+        self.discriminator_3and4 = DiscriminatorFactorConv(n_filters * 4, n_filters * 8,
+                                                           dim_x_y=image_size//8,
+                                                           **kw_args)
         self.discriminator_4and5 = DiscriminatorFactorFC((image_size //16)** 2 * n_filters * 8 +
                                                           noise_dim,
                                                           noise_dim*2,
@@ -805,10 +680,7 @@ class Discriminator(nn.Module):
         self.which_layers = 'all'
 
         # init
-        if he_init:
-            self.apply(weights_init_he)
-        else:
-            self.apply(weights_init)
+        self.apply(weights_init)
 
         # logging
         self.log_intermediate_Ds = log_intermediate_Ds
@@ -969,20 +841,6 @@ def slerp(interp, low, high):
                      torch.sin((1.0-interp)*omega) / so * low + torch.sin(interp*omega) / so * high) #SLERP
     return out
 
-def weights_init_he(net):
-    for m in net.modules():
-        if isinstance(m, nn.Conv2d):
-            m.weight.data.normal_(0, 1)
-            if m.bias is not None:
-                m.bias.data.zero_()
-        elif isinstance(m, nn.ConvTranspose2d):
-            m.weight.data.normal_(0, 1)
-            if m.bias is not None:
-                m.bias.data.zero_()
-        elif isinstance(m, nn.Linear):
-            m.weight.data.normal_(0, 1)
-            if m.bias is not None:
-                m.bias.data.zero_()
 
 def weights_init(net):
     for m in net.modules():
