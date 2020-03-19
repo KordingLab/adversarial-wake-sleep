@@ -23,7 +23,7 @@ class Generator(nn.Module):
         self.generative_5to4_conv = nn.Sequential(
             # input is Z, going into a convolution
             nn.ConvTranspose2d(noise_dim, n_filters * 8, image_size//16, 1, 0 ),
-            RescaleAndAddNoise(noise_dim/2, 1 ,noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(noise_dim, 1 ,noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -31,7 +31,7 @@ class Generator(nn.Module):
         self.generative_4to3_conv = nn.Sequential(
             # state size. (n_filters*8) x 4 x 4
             nn.ConvTranspose2d(n_filters * 8, n_filters * 4, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 8, 1, noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(n_filters * 8, 2, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -39,7 +39,7 @@ class Generator(nn.Module):
         self.generative_3to2_conv = nn.Sequential(
             # state size. (n_filters*4) x 8 x 8
             nn.ConvTranspose2d(n_filters * 4, n_filters * 2, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 4, 1,noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(n_filters * 4, 2,noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -47,7 +47,7 @@ class Generator(nn.Module):
         self.generative_2to1_conv = nn.Sequential(
             # state size. (n_filters*2) x 16 x 16
             nn.ConvTranspose2d(n_filters * 2, n_filters, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 2, 1, noise_sigma, rescale=he_init),
+            RescaleAndAddNoise(n_filters * 2, 2, noise_sigma, rescale=he_init),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -55,7 +55,7 @@ class Generator(nn.Module):
 
         self.generative_1to0_conv = nn.Sequential(
             nn.ConvTranspose2d(n_filters, n_img_channels, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters, 1, 0, rescale=he_init),
+            RescaleAndAddNoise(n_filters, 2, 0, rescale=he_init),
             nn.Tanh()
             # state size. (n_img_channels) x 64 x 64
         )

@@ -11,7 +11,7 @@ import torch.distributed as dist
 
 
 from dcgan_models import DeterministicHelmholtz, Discriminator, HistoricalAverageDiscriminatorLoss
-from utils import sv_img
+from utils import sv_img, get_gradient_stats
 
 import argparse
 import os
@@ -119,6 +119,10 @@ parser.add_argument('--soft-div-norm', default=0, type=float,
                    ' If greater than zero, this is the strength by which the penalty is applied. Default 0.')
 parser.add_argument('--he-initialization', action='store_true',
                     help='As in ProgressiveGANs. Plays well with divisive normalization')
+parser.add_argument('--gradient-clipping', default=0, type=float,
+                    help="CLip gradients on everything at this value")
+parser.add_argument('--amsgrad', action='store_true',
+                    help="Use AMSgrad?")
 
 
 def train(args, cortex, train_loader, discriminator,
@@ -238,16 +242,25 @@ def train(args, cortex, train_loader, discriminator,
                        nn.BCELoss()(discriminator(cortex.inference.intermediate_state_dict),
                                     Variable(torch.zeros(batch_size, 1).to(real_samples.device)))
 
-        disc_loss.backward()
-        optimizerD.step()
 
+        disc_loss.backward()
         gen_loss.backward()
+
+        # Clip gradients?
+        if args.gradient_clipping > 0:
+            nn.utils.clip_grad_norm_(cortex.parameters(), args.gradient_clipping, "inf")
+            nn.utils.clip_grad_norm_(discriminator.parameters(), args.gradient_clipping, "inf")
+
+        optimizerD.step()
         optimizerG.step()
         optimizerF.step()
 
         if not args.quiet:
             if batch % 100 == 0:
                 print("Epoch {} Batch {} Overall surprisal {:.2f}".format(epoch, batch, ML_loss.item()))
+
+                # print("Max discriminator gradient {}".format(get_gradient_stats(discriminator)))
+                # print("Max cortex gradient {}".format(get_gradient_stats(cortex)))
 
 
 
@@ -431,9 +444,12 @@ def main_worker(gpu, ngpus_per_node, args):
         inference_params = cortex.inference.parameters()
         discriminator_params = discriminator.parameters()
 
-    optimizerD = optim.Adam(discriminator_params, lr=args.lr_d, betas=(args.beta1, 0.999), weight_decay = args.wd)
-    optimizerG = optim.Adam(generator_params,     lr=args.lr_c, betas=(args.beta1, 0.999), weight_decay = args.wd)
-    optimizerF = optim.Adam(inference_params,     lr=args.lr_c, betas=(args.beta1, 0.999), weight_decay = args.wd)
+    optimizerD = optim.Adam(discriminator_params, lr=args.lr_d, betas=(args.beta1, 0.999), weight_decay = args.wd,
+                                                                                           amsgrad = args.amsgrad)
+    optimizerG = optim.Adam(generator_params,     lr=args.lr_c, betas=(args.beta1, 0.999), weight_decay = args.wd,
+                                                                                            amsgrad = args.amsgrad)
+    optimizerF = optim.Adam(inference_params,     lr=args.lr_c, betas=(args.beta1, 0.999), weight_decay = args.wd,
+                                                                                            amsgrad = args.amsgrad)
 
     # ------ optionally resume from a checkpoint ------- #
     if args.resume:
