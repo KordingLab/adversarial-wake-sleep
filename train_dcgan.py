@@ -17,6 +17,7 @@ import argparse
 import os
 import random
 import warnings
+from itertools import chain
 
 
 parser = argparse.ArgumentParser(description='PyTorch Adversarial Wake-Sleep Training on MNIST')
@@ -244,14 +245,20 @@ def train(args, cortex, train_loader, discriminator,
 
 
         disc_loss.backward()
-        gen_loss.backward()
 
         # Clip gradients?
         if args.gradient_clipping > 0:
-            nn.utils.clip_grad_norm_(cortex.parameters(), args.gradient_clipping, "inf")
-            nn.utils.clip_grad_norm_(discriminator.parameters(), args.gradient_clipping, "inf")
+            nn.utils.clip_grad_norm_(discriminator.parameters(),
+                                     args.gradient_clipping, "inf")
 
         optimizerD.step()
+
+        gen_loss.backward()
+        # Clip gradients?
+        if args.gradient_clipping > 0:
+            # do them together to not mess with the ratio of learning rates
+            nn.utils.clip_grad_norm_(cortex.parameters(),
+                                     args.gradient_clipping, "inf")
         optimizerG.step()
         optimizerF.step()
 
@@ -259,7 +266,6 @@ def train(args, cortex, train_loader, discriminator,
             if batch % 100 == 0:
                 print("Epoch {} Batch {} Overall surprisal {:.2f}".format(epoch, batch, ML_loss.item()))
 
-                # print("Max discriminator gradient {}".format(get_gradient_stats(discriminator)))
                 # print("Max cortex gradient {}".format(get_gradient_stats(cortex)))
 
 
