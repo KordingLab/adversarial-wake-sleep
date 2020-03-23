@@ -21,6 +21,7 @@ class Generator(nn.Module):
                 'learned_filter' = Tariance that is the result of a learned filter
                                             on the previous layer. Like the `reparameterization trick` of 
                                             variational autoencoders.
+                'poisson' = variance is equal to value
     backprop_to_start
     image_size
     batchnorm
@@ -227,8 +228,7 @@ class DeterministicHelmholtz(nn.Module):
     surprisal_sigma = how strongly to follow the gradient of layer-wise surprisal
                         (or, variance of the gaussian distribution asserted when comparing predicted
                             vs. actual lower-layer activity)
-    log_intermediate_surprisals = whether to keep an internal variable storing the layer-wise surprisals during training
-    log_intermediate_reconstructions = whether to keep an internal variable storing the layer-wise reconstructions
+
     """
 
     def __init__(self, noise_dim, n_filters, n_img_channels,
@@ -929,6 +929,7 @@ class AddNoise(nn.Module):
             'learned_filter' = Variance that is the result of a learned filter
                                         on the previous layer. Like the `reparameterization trick` of
                                         variational autoencoders.
+            'poisson' = variance is equal to value, divided by 10
 
     Note: if `learned_filter` is used, the inputs of the previous layer are interpreted so that the first half
     of channels are the mean and the second half of channels of the variance of the distribution that is the
@@ -949,7 +950,8 @@ class AddNoise(nn.Module):
             self.log_sigma = nn.Parameter(torch.ones(1) * -2)
         elif self.noise_type == 'learned_by_channel':
             self.log_sigma = nn.Parameter(torch.ones(n_channels) * -2)
-
+        elif self.noise_type == 'poisson':
+            self.relu = nn.ReLU()
 
     def forward(self, x):
         if self.noise_type == 'none':
@@ -979,9 +981,13 @@ class AddNoise(nn.Module):
 
             noise = torch.empty_like(mu).normal_()
             out = mu + noise * torch.exp(log_sigma)
+        elif self.noise_type == 'poisson':
+            noise = torch.empty_like(x).normal_()
+            out = x + noise * self.relu(x) / 10
         else:
             raise AssertionError("noise_type not in "
-                                 "['none', 'fixed', 'learned_by_layer', 'learned_by_channel', 'learned_filter']")
+                                 "['none', 'fixed', 'learned_by_layer', 'learned_by_channel', "
+                                 "'poisson', 'learned_filter']")
             
         return out
 
