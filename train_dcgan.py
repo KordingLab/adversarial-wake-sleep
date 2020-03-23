@@ -88,7 +88,7 @@ parser.add_argument('--lamda', default=.1, type=float,
                     help='Lambda for the gradient penalty in the WGAN formulation. Only for Wasserstein loss.')
 
 parser.add_argument('--noise-type', default = 'none',
-                    choices= ['none', 'fixed', 'learned_by_layer', 'learned_by_channel', 'learned_filter'],
+                    choices= ['none', 'fixed', 'learned_by_layer', 'learned_by_channel', 'learned_filter', 'poisson'],
                     help="What variance of Gaussian noise should be applied after all layers in the "
                             "cortex? See docs for details. Default is no noise; fixed has variance 0.01")
 
