@@ -86,8 +86,11 @@ parser.add_argument('--minimize-inference-surprisal', action='store_true',
                     help='Minimize generator surprisal using value of sigma set.')
 parser.add_argument('--lamda', default=.1, type=float,
                     help='Lambda for the gradient penalty in the WGAN formulation. Only for Wasserstein loss.')
-parser.add_argument('--noise-sigma', default=0, type=float,
-                    help='If set, add Gaussian noise with this variance to the pre-Relu activations of both passes.')
+
+parser.add_argument('--noise-type', default = 'none',
+                    choices= ['none', 'fixed', 'learned_by_layer', 'learned_by_channel', 'learned_filter'],
+                    help="What variance of Gaussian noise should be applied after all layers in the "
+                            "cortex? See docs for details. Default is no noise; fixed has variance 0.01")
 
 
 parser.add_argument('--no-backprop-through-full-cortex', action='store_true',
@@ -124,6 +127,9 @@ parser.add_argument('--gradient-clipping', default=0, type=float,
                     help="CLip gradients on everything at this value")
 parser.add_argument('--amsgrad', action='store_true',
                     help="Use AMSgrad?")
+parser.add_argument('--learn_variance', action='store_true',
+                    help="As in variational autoencoders, add Gaussian noise of a variance which is learned. "
+                    "a.k.a. the reparameterization trick.")
 
 
 def train(args, cortex, train_loader, discriminator,
@@ -392,6 +398,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                     detailed_logging=args.detailed_logging,
                                     backprop_to_start_inf=bp_thru_inf,
                                     backprop_to_start_gen=bp_thru_gen,
+                                    noise_type = args.noise_type,
                                     batchnorm = bn,
                                     normalize = args.divisive_normalization,
                                     he_init=args.he_initialization)

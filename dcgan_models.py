@@ -7,7 +7,28 @@ import math
 from numpy import prod
 
 class Generator(nn.Module):
-    def __init__(self, noise_dim, n_filters, n_img_channels, noise_sigma = 0, backprop_to_start = True,
+    """ The feedback edges of the cortex. Generates images with the DCGAN architecture.
+    
+    Parameters
+    noise_dim
+    n_filters
+    n_img_channels
+    noise_type: What sort of noise is applied after each convolutional layer? Gaussian, but of what variance?
+                'fixed' = Noise is always Gaussian with variance 0.01
+                'none' = No noise
+                'learned_by_layer' = The variance is learned and different for each layer
+                'learned_by_channel' = The variance is learned and different for each channel and each layer
+                'learned_filter' = Tariance that is the result of a learned filter
+                                            on the previous layer. Like the `reparameterization trick` of 
+                                            variational autoencoders.
+    backprop_to_start
+    image_size
+    batchnorm
+    normalize
+    he_init
+    
+    """
+    def __init__(self, noise_dim, n_filters, n_img_channels, noise_type = 'none', backprop_to_start = True,
                  image_size = 64, batchnorm = False, normalize = False, he_init = False):
         super(Generator, self).__init__()
         self.noise_dim = noise_dim
@@ -15,47 +36,55 @@ class Generator(nn.Module):
         self.n_img_channels = n_img_channels
         self.backprop_to_start = backprop_to_start
 
-        # Regarding he initialization:
+        # A small note regarding he initialization (if used) for those curious:
         # An interesting thing with the ConvTranspose is that the number of effective inputs is not
         # kernel_size ** 2 * in_channels, but rather depends on the stride and size (due to expansion
         # of the inputs and convolving with padding; both implicitly apply 0s)
 
+        # In the learned_filter mode, all conv layers need to output twice the number of channels as before.
+        maybetimestwo = 2 if noise_type=="learned_filter" else 1
+
         self.generative_5to4_conv = nn.Sequential(
             # input is Z, going into a convolution
-            nn.ConvTranspose2d(noise_dim, n_filters * 8, image_size//16, 1, 0 ),
-            RescaleAndAddNoise(noise_dim, 1 ,noise_sigma, rescale=he_init),
+            nn.ConvTranspose2d(noise_dim, n_filters * 8 * maybetimestwo, image_size//16, 1, 0 ),
+            MaybeHeRescale(noise_dim, 1,rescale=he_init),
+            AddNoise(noise_type, n_filters * 8),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
 
         self.generative_4to3_conv = nn.Sequential(
             # state size. (n_filters*8) x 4 x 4
-            nn.ConvTranspose2d(n_filters * 8, n_filters * 4, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 8, 2, noise_sigma, rescale=he_init),
+            nn.ConvTranspose2d(n_filters * 8, n_filters * 4 * maybetimestwo, 4, 2, 1 ),
+            MaybeHeRescale(n_filters * 8, 2, rescale=he_init),
+            AddNoise(noise_type, n_filters * 4),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
 
         self.generative_3to2_conv = nn.Sequential(
             # state size. (n_filters*4) x 8 x 8
-            nn.ConvTranspose2d(n_filters * 4, n_filters * 2, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 4, 2,noise_sigma, rescale=he_init),
+            nn.ConvTranspose2d(n_filters * 4, n_filters * 2 * maybetimestwo, 4, 2, 1 ),
+            MaybeHeRescale(n_filters * 4, 2, rescale=he_init),
+            AddNoise(noise_type, n_filters * 2),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
 
         self.generative_2to1_conv = nn.Sequential(
             # state size. (n_filters*2) x 16 x 16
-            nn.ConvTranspose2d(n_filters * 2, n_filters, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 2, 2, noise_sigma, rescale=he_init),
+            nn.ConvTranspose2d(n_filters * 2, n_filters * maybetimestwo, 4, 2, 1 ),
+            MaybeHeRescale(n_filters * 2, 2, rescale=he_init),
+            AddNoise(noise_type, n_filters),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
             # state size. (n_filters) x 32 x 32
 
         self.generative_1to0_conv = nn.Sequential(
-            nn.ConvTranspose2d(n_filters, n_img_channels, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters, 2, 0, rescale=he_init),
+            nn.ConvTranspose2d(n_filters, n_img_channels * maybetimestwo, 4, 2, 1 ),
+            MaybeHeRescale(n_filters, 2, rescale=he_init),
+            AddNoise(noise_type, n_img_channels),
             nn.Tanh()
             # state size. (n_img_channels) x 64 x 64
         )
@@ -103,7 +132,7 @@ class Generator(nn.Module):
 
 
 class Inference(nn.Module):
-    def __init__(self, noise_dim, n_filters, n_img_channels, noise_sigma = 0, backprop_to_start = True,
+    def __init__(self, noise_dim, n_filters, n_img_channels, noise_type = 'none', backprop_to_start = True,
                  image_size = 64, batchnorm = False, normalize = False, he_init = False):
         super(Inference, self).__init__()
         self.noise_dim = noise_dim
@@ -111,36 +140,44 @@ class Inference(nn.Module):
         self.n_img_channels = n_img_channels
         self.backprop_to_start = backprop_to_start
 
+        # In the learned_filter mode, all conv layers need to output twice the number of channels as before.
+        maybetimestwo = 2 if noise_type=="learned_filter" else 1
+
 
         self.inference_4to5_conv = nn.Sequential(
-            nn.Conv2d(n_filters * 8, noise_dim, image_size // 16, 1, 0 ),
-            RescaleAndAddNoise( n_filters * 8, image_size // 16,noise_sigma, rescale=he_init),
+            nn.Conv2d(n_filters * 8, noise_dim * maybetimestwo, image_size // 16, 1, 0 ),
+            MaybeHeRescale(n_filters * 8, image_size // 16, rescale=he_init),
+            AddNoise(noise_type, noise_dim)
         )
 
         self.inference_3to4_conv = nn.Sequential(
-            nn.Conv2d(n_filters * 4, n_filters * 8, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 4, 4, noise_sigma, rescale=he_init),
+            nn.Conv2d(n_filters * 4, n_filters * 8 * maybetimestwo, 4, 2, 1 ),
+            MaybeHeRescale(n_filters * 4, 4, rescale=he_init),
+            AddNoise(noise_type, n_filters * 8),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
 
         self.inference_2to3_conv = nn.Sequential(
-            nn.Conv2d(n_filters * 2, n_filters * 4, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters * 2, 4, noise_sigma, rescale=he_init),
+            nn.Conv2d(n_filters * 2, n_filters * 4 * maybetimestwo, 4, 2, 1 ),
+            MaybeHeRescale(n_filters * 2, 4, rescale=he_init),
+            AddNoise(noise_type, n_filters * 4),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
 
         self.inference_1to2_conv = nn.Sequential(
-            nn.Conv2d(n_filters, n_filters * 2, 4, 2, 1 ),
-            RescaleAndAddNoise(n_filters, 4, noise_sigma, rescale=he_init),
+            nn.Conv2d(n_filters, n_filters * 2 * maybetimestwo, 4, 2, 1 ),
+            MaybeHeRescale(n_filters, 4, rescale=he_init),
+            AddNoise(noise_type, n_filters * 2),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
 
         self.inference_0to1_conv = nn.Sequential(
-            nn.Conv2d(n_img_channels, n_filters, 4, 2, 1 ),
-            RescaleAndAddNoise(n_img_channels, 4, noise_sigma, rescale=he_init),
+            nn.Conv2d(n_img_channels, n_filters * maybetimestwo, 4, 2, 1 ),
+            MaybeHeRescale(n_img_channels, 4, rescale=he_init),
+            AddNoise(noise_type, n_filters),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
             nn.ReLU(),
             NormalizationLayer() if normalize else null())
@@ -197,7 +234,7 @@ class DeterministicHelmholtz(nn.Module):
     def __init__(self, noise_dim, n_filters, n_img_channels,
                  image_size = 64,
                  surprisal_sigma=1.0,
-                 noise_sigma = 0,
+                 noise_type = None,
                  detailed_logging = True,
                  backprop_to_start_inf=True,
                  backprop_to_start_gen=True,
@@ -208,9 +245,9 @@ class DeterministicHelmholtz(nn.Module):
 
         assert image_size % 16 == 0
 
-        self.inference = Inference(noise_dim, n_filters, n_img_channels, noise_sigma, backprop_to_start_inf, image_size,
+        self.inference = Inference(noise_dim, n_filters, n_img_channels, noise_type, backprop_to_start_inf, image_size,
                                    batchnorm=batchnorm, normalize=normalize, he_init = he_init)
-        self.generator = Generator(noise_dim, n_filters, n_img_channels, noise_sigma, backprop_to_start_gen, image_size,
+        self.generator = Generator(noise_dim, n_filters, n_img_channels, noise_type, backprop_to_start_gen, image_size,
                                    batchnorm=batchnorm, normalize=normalize, he_init = he_init)
 
         # init
@@ -526,8 +563,8 @@ class DiscriminatorFactorConv(nn.Module):
         self.mid_disc_layers = nn.ModuleList([nn.Sequential(nn.Conv2d((2 ** i) * inner_channels_per_layer,
                                                                       (2 ** (i+1)) * inner_channels_per_layer,
                                                                       4,2,1),
-                                                            RescaleAndAddNoise((2 ** i) * inner_channels_per_layer, 4,
-                                                                               0, rescale=he_init),
+                                                            MaybeHeRescale((2 ** i) * inner_channels_per_layer, 4,
+                                                                           rescale=he_init),
                                                             nn.BatchNorm2d(inner_channels_per_layer * (2 ** (i+1))) if batchnorm else null(),
                                                             nn.LeakyReLU(.2, inplace=True),
                                                             NormalizationLayer() if normalize else null())
@@ -879,27 +916,86 @@ def weights_init_he(net):
             if m.bias is not None:
                 m.bias.data.zero_()
 
-class RescaleAndAddNoise(nn.Module):
+class AddNoise(nn.Module):
+    """
+    Adds some noise with a certain variance.
+
+    noise_type: What sort of noise is applied after each convolutional layer? Gaussian, but of what variance?
+            'fixed' = Noise is always Gaussian with variance 0.01
+            'none' = No noise
+            'learned_by_layer' = The variance is learned and different for each layer
+            'learned_by_channel' = The variance is learned and different for each channel and each layer.
+                                        Requires n_channels be set.
+            'learned_filter' = Variance that is the result of a learned filter
+                                        on the previous layer. Like the `reparameterization trick` of
+                                        variational autoencoders.
+
+    Note: if `learned_filter` is used, the inputs of the previous layer are interpreted so that the first half
+    of channels are the mean and the second half of channels of the variance of the distribution that is the
+    outputs of the layer. In this case this module results in outputs that are not of the same shape
+    as the inputs but rather of half the number of channel dimensions.
+
+    For alo other modes, the output is of the same shape as the inputs.
+
+    """
+
+    def __init__(self, noise_type, n_channels = None, fixed_variance = 0.01):
+        super(AddNoise, self).__init__()
+
+        self.noise_type = noise_type
+        if self.noise_type == 'fixed':
+            self.fixed_variance = fixed_variance
+        elif self.noise_type == 'learned_by_layer':
+            self.log_sigma = nn.Parameter(torch.ones(1) * -2)
+        elif self.noise_type == 'learned_by_channel':
+            self.log_sigma = nn.Parameter(torch.ones(n_channels) * -2)
+
+
+    def forward(self, x):
+        if self.noise_type == 'none':
+            out = x
+
+        elif self.noise_type == 'fixed':
+            noise = torch.empty_like(x).normal_()
+            out = x + noise * self.fixed_variance
+
+        elif self.noise_type == 'learned_by_layer':
+            noise = torch.empty_like(x).normal_()
+            out = x + noise * torch.exp(self.log_sigma)
+
+        elif self.noise_type == 'learned_by_channel':
+            noise = torch.empty_like(x).normal_()
+            out = x + noise * torch.exp(self.log_sigma)[None,:,None,None]
+
+        elif self.noise_type == 'learned_filter':
+            n_channels = x.size()[1]
+            assert n_channels % 2 == 0
+    
+            mu = x[:, :n_channels//2,:,:]
+            log_sigma = x[:, n_channels//2:,:,:]
+
+            #rescale log_sigma and shrink. This is just to make the initialization the right scale
+            log_sigma = log_sigma * .01 - 2
+
+            noise = torch.empty_like(mu).normal_()
+            out = mu + noise * torch.exp(log_sigma)
+        else:
+            raise AssertionError("noise_type not in "
+                                 "['none', 'fixed', 'learned_by_layer', 'learned_by_channel', 'learned_filter']")
+            
+        return out
+
+
+class MaybeHeRescale(nn.Module):
     """
     First rescale the outputs of the previous layer based on that layer's He constant. Then,
     add zero-mean Gaussian noise of a given variance if noise_sigma is greater than 0; else do nothing."""
-    def __init__(self, in_channels, kernel, noise_sigma = 0, rescale = True):
-        super(RescaleAndAddNoise, self).__init__()
-
-        if noise_sigma > 0:
-            self.noise_dist = Normal(torch.tensor([0.0]), torch.tensor([noise_sigma]))
-        else:
-            self.noise_dist = None
-
+    def __init__(self, in_channels, kernel, rescale = True):
+        super(MaybeHeRescale, self).__init__()
         self.weight = math.sqrt(2/(in_channels * kernel**2)) if rescale else 1
 
     def forward(self, x):
-
         x = x*self.weight
-
-        if self.noise_dist is not None:
-            noise = self.noise_dist.sample(x.size()).to(x.device).squeeze(dim=-1)
-            x += noise
         return x
 
 def getLayerNormalizationFactor(module):
