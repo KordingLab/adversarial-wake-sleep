@@ -93,26 +93,25 @@ def main(args):
     if args.gpu is not None:
         warnings.warn('You have chosen a specific GPU. ')
 
-
-
     cortex = load_cortex(args.path, args)
 
-    accuracies = decode_classes_from_layers(args.gpu,
-                              cortex,
-                              args.image_size,
-                              args.n_filters,
-                              args.noise_dim,
-                              args.data,
-                              args.dataset,
-                              args.nonlinear,
-                              args.lr,
-                              args.n_folds,
-                              args.epochs,
-                              args.hidden_size,
-                              args.wd,
-                              args.opt,
-                              args.lr_schedule
-                              )
+    accuracies =   decode_classes_from_layers(args.gpu,
+                                              cortex,
+                                              args.image_size,
+                                              args.n_filters,
+                                              args.noise_dim,
+                                              args.data,
+                                              args.dataset,
+                                              args.nonlinear,
+                                              args.lr,
+                                              args.n_folds,
+                                              args.epochs,
+                                              args.hidden_size,
+                                              args.wd,
+                                              args.opt,
+                                              args.lr_schedule,
+                                              args.batch_size,
+                                              args.workers)
 
     for i in range(6):
         print("Layer{}: Accuracy {} +/- {}".format(i, accuracies.mean(dim=0)[i],accuracies.std(dim=0)[i]))
@@ -167,7 +166,7 @@ def train(cortex, optimizer, decoder, train_loader, gpu):
         loss.backward()
         optimizer.step()
 
-def test(cortex, decoder, test_loader, gpu, epoch, n_examples):
+def test(cortex, decoder, test_loader, gpu, epoch, n_examples, verbose = False):
     """Returns the classification error and loss on this fold of the test set for each of the 5 layers + the input"""
     cortex.eval()
     decoder.eval()
@@ -189,11 +188,13 @@ def test(cortex, decoder, test_loader, gpu, epoch, n_examples):
             correct[i] += float((predicted == labels).sum().item())
 
     accuracies = []
-    print('Epoch {}: accuracy on {} test images:'.format(epoch, n_examples))
+    if verbose:
+        print('Epoch {}: accuracy on {} test images:'.format(epoch, n_examples))
     for i in range(6):
         accuracy = 100 * correct[i] / total
-        print('Layer{}: {}'.format(i, accuracy))
         accuracies.append(accuracy)
+        if verbose:
+            print('Layer{}: {}'.format(i, accuracy))
 
     return accuracies
 
@@ -211,7 +212,10 @@ def decode_classes_from_layers(gpu,
                               hidden_size = 1000,
                               wd = 1e-4,
                               opt = 'adam',
-                              lr_schedule = False):
+                              lr_schedule = False,
+                              batch_size = 128,
+                              workers = 4,
+                              verbose = True):
 
     """ Trains a linear or nonlinear decoder from a given layer of the cortex, all layers at a time (including inputs)
 
@@ -242,7 +246,7 @@ def decode_classes_from_layers(gpu,
         nc = 3
         n_classes = 1000
     elif dataset == 'cifar10':
-        all_test_dataset = datasets.CIFAR10(root=args.data, download=True, train=False,
+        all_test_dataset = datasets.CIFAR10(root=data_path, download=True, train=False,
                                transform=transforms.Compose([
                                    transforms.Resize(image_size),
                                    transforms.ToTensor(),
@@ -251,7 +255,7 @@ def decode_classes_from_layers(gpu,
         nc = 3
         n_classes = 10
     elif dataset == 'mnist':
-        all_test_dataset = datasets.MNIST(root=args.data, download=True, train=False,
+        all_test_dataset = datasets.MNIST(root=data_path, download=True, train=False,
                              transform=transforms.Compose([
                                  transforms.Resize(image_size),
                                  transforms.ToTensor(),
@@ -281,11 +285,11 @@ def decode_classes_from_layers(gpu,
         test_dataset = Subset(all_test_dataset, test_idx)
 
         train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.workers, pin_memory=True,)
+            train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=workers, pin_memory=True,)
         test_loader = torch.utils.data.DataLoader(
-            test_dataset, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.workers, pin_memory=True,)
+            test_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=workers, pin_memory=True,)
 
         # ----- Build decoder ------
         if nonlinear:
@@ -294,9 +298,9 @@ def decode_classes_from_layers(gpu,
             decoder = LinearDecoder(image_size, noise_dim, n_classes, nc, n_filters)
 
         # get to proper GPU
-        torch.cuda.set_device(args.gpu)
-        cortex = cortex.cuda(args.gpu)
-        decoder = decoder.cuda(args.gpu)
+        torch.cuda.set_device(gpu)
+        cortex = cortex.cuda(gpu)
+        decoder = decoder.cuda(gpu)
 
         # ------ Build optimizer ------ #
 
@@ -311,8 +315,8 @@ def decode_classes_from_layers(gpu,
             if lr_schedule:
                 adjust_lr(epoch, optimizer, epochs)
             train(cortex, optimizer, decoder, train_loader, gpu)
-
-            accuracies = test(cortex, decoder, test_loader, gpu, epoch, len(test_idx))
+            if verbose or (epoch==epochs-1):
+                accuracies = test(cortex, decoder, test_loader, gpu, epoch, len(test_idx), verbose)
 
         all_accuracies.append(accuracies)
 

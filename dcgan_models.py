@@ -537,6 +537,7 @@ class DiscriminatorFactorConv(nn.Module):
                  batchnorm = True,
                  normalize = False,
                  log_channel_norms = False,
+                 detailed_logging = False,
                  he_init = False):
         super(DiscriminatorFactorConv, self).__init__()
         self.he_init = he_init
@@ -588,10 +589,10 @@ class DiscriminatorFactorConv(nn.Module):
         self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null()
 
         self.log_channel_norms = log_channel_norms
-        if log_channel_norms:
-            self.channel_norms = {layer: [] for layer in range(n_inter_layers)}
-            self.current_channel_norms = {}
-            self.mse = nn.MSELoss()
+        self.detailed_logging = detailed_logging
+        self.channel_norms = {layer: [] for layer in range(n_inter_layers)}
+        self.current_channel_norms = {}
+        self.mse = nn.MSELoss()
 
 
     def forward(self, h1, h2):
@@ -610,7 +611,8 @@ class DiscriminatorFactorConv(nn.Module):
             if self.log_channel_norms:
                 n = self.get_channel_norm(x)
                 self.current_channel_norms[i] = n
-                self.channel_norms[i].append(n.mean().item())
+                if self.detailed_logging:
+                    self.channel_norms[i].append(n.mean().item())
 
         # maybe get std dev over batch
         if self.eval_std_dev:
@@ -677,7 +679,8 @@ class Discriminator(nn.Module):
                  eval_std_dev=False,
                  avg_after_n_layers=False,
                  normalize = False,
-                 he_init = False):
+                 he_init = False,
+                 detailed_logging = False):
         super(Discriminator, self).__init__()
 
         self.layer_names = layer_names
@@ -693,7 +696,8 @@ class Discriminator(nn.Module):
                    "avg_after_n_layers": avg_after_n_layers,
                    "normalize":normalize,
                    "log_channel_norms": log_intermediate_Ds,
-                   "he_init":he_init}
+                   "he_init":he_init,
+                   "detailed_logging": detailed_logging}
 
         self.discriminator_0and1 = DiscriminatorFactorConv(n_img_channels, n_filters,
                                                            dim_x_y=image_size,

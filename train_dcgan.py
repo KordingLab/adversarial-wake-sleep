@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 from torch import optim
 from torch.autograd import Variable
 from torchvision import datasets, transforms, utils
@@ -17,8 +19,9 @@ import argparse
 import os
 import random
 import warnings
-from itertools import chain
 
+from orion.client import report_results
+from classify_from_model import decode_classes_from_layers
 
 parser = argparse.ArgumentParser(description='PyTorch Adversarial Wake-Sleep Training on MNIST')
 parser.add_argument('-d', '--data', metavar='DIR', default = "../data",
@@ -55,17 +58,19 @@ parser.add_argument('--resume', default='', type=str, metavar='PATH',
 parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256)')
-parser.add_argument('--lr-c', '--learning-rate-cortex', default=1e-4, type=float,
-                    metavar='LRC', help='initial learning rate of the inference and generator. Default 1e-4', dest='lr_c')
+parser.add_argument('--lr-g', default=1e-4, type=float,
+                    metavar='LRC', help='initial learning rate of the generator. Default 1e-4', dest='lr_g')
 parser.add_argument('--lr-d', '--learning-rate-discriminator', default=5e-4, type=float,
                     metavar='LRD', help='initial learning rate of the discriminator. Default 5e-4', dest='lr_d')
+parser.add_argument('--lr-e',  default=5e-4, type=float,
+                    metavar='LRD', help='initial learning rate of the encoder. Default 5e-4', dest='lr_e')
 parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)',
                     dest='wd')
 parser.add_argument('--beta1',  default=.5, type=float,
                     help='In the adam optimizer. Default = 0.5')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
-                    help='number of total epochs to run. Default 90')
+                    help='number of total epochs to run. Default 200')
 parser.add_argument('--loss-type', default='BCE',
                     choices= ['BCE', 'wasserstein', 'hinge'],
                     help="The form of the minimax loss function. BCE = binary cross entropy of the original GAN")
@@ -173,7 +178,7 @@ def train(args, cortex, train_loader, discriminator,
         # now update generator with the wake-sleep step
         # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
         # with Gaussian we have log p  = MSE between actual and predicted
-        if args.minimize_generator_surprisal or args.detailed_logging:
+        if args.minimize_generator_surprisal or args.detailed_logging or args.soft_div_norm>0:
             ML_loss = cortex.generator_surprisal()
         if args.minimize_generator_surprisal:
             ML_loss.backward()
@@ -406,11 +411,12 @@ def main_worker(gpu, ngpus_per_node, args):
     discriminator = Discriminator(image_size, cortex.layer_names,
                                   args.noise_dim, args.n_filters, nc,
                                   lambda_=args.lamda, loss_type=args.loss_type,
-                                  log_intermediate_Ds=args.detailed_logging,
+                                  log_intermediate_Ds=args.detailed_logging or (args.soft_div_norm>0),
                                   avg_after_n_layers=avg_after_n_layers,
                                   eval_std_dev = args.minibatch_std_dev,
                                   normalize=args.divisive_normalization,
-                                  he_init=args.he_initialization)
+                                  he_init=args.he_initialization,
+                                  detailed_logging=args.detailed_logging)
 
     # get to proper GPU
     if args.distributed:
@@ -459,9 +465,9 @@ def main_worker(gpu, ngpus_per_node, args):
 
     optimizerD = optim.Adam(discriminator_params, lr=args.lr_d, betas=(args.beta1, 0.999), weight_decay = args.wd,
                                                                                            amsgrad = args.amsgrad)
-    optimizerG = optim.Adam(generator_params,     lr=args.lr_c, betas=(args.beta1, 0.999), weight_decay = args.wd,
+    optimizerG = optim.Adam(generator_params,     lr=args.lr_g, betas=(args.beta1, 0.999), weight_decay = args.wd,
                                                                                             amsgrad = args.amsgrad)
-    optimizerF = optim.Adam(inference_params,     lr=args.lr_c, betas=(args.beta1, 0.999), weight_decay = args.wd,
+    optimizerF = optim.Adam(inference_params,     lr=args.lr_e, betas=(args.beta1, 0.999), weight_decay = args.wd,
                                                                                             amsgrad = args.amsgrad)
 
     # ------ optionally resume from a checkpoint ------- #
@@ -493,6 +499,8 @@ def main_worker(gpu, ngpus_per_node, args):
                          'reconstruction_error': []}
         args.start_epoch = 0
 
+    decoding_error_history = []
+
     for epoch in range(args.start_epoch, args.epochs):
 
         if args.distributed:
@@ -515,10 +523,35 @@ def main_worker(gpu, ngpus_per_node, args):
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                     and args.rank % ngpus_per_node == 0):
+            if args.detailed_logging or (epoch == args.epochs-1):
+                # how well can we decode from layers?
+                accuracies = decode_classes_from_layers(  args.gpu,
+                                                              cortex,
+                                                              image_size,
+                                                              args.n_filters,
+                                                              args.noise_dim,
+                                                              args.data,
+                                                              args.dataset,
+                                                              nonlinear = False,
+                                                              lr = 1,
+                                                              folds = 8,
+                                                              epochs = 20,
+                                                              hidden_size = 1000,
+                                                              wd = 1e-3,
+                                                              opt = 'sgd',
+                                                              lr_schedule = True,
+                                                              verbose=False,
+                                                              batch_size=args.batch_size,
+                                                              workers=args.workers)
+                for i in range(6):
+                    print("Layer{}: Accuracy {} +/- {}".format(i, accuracies.mean(dim=0)[i],accuracies.std(dim=0)[i]))
+                decoding_error_history.append(accuracies.mean(dim=0).detach().cpu())
+
             torch.save({
                 'epoch': epoch + 1,
                 'cortex_state_dict': cortex.state_dict(),
                 'discriminator_state_dict': discriminator.state_dict(),
+                'args': args,
                 'optimizerD': optimizerD.state_dict(),
                 'optimizerG': optimizerG.state_dict(),
                 'optimizerF': optimizerF.state_dict(),
@@ -527,8 +560,17 @@ def main_worker(gpu, ngpus_per_node, args):
                                   "reconstructions": cortex.intermediate_reconstructions,
                                   "weight_alignment": cortex.weight_alignment,
                                   "cortex_channel_magnitudes": cortex.channel_norms,
-                                  "discriminator_channel_magnitudes": discriminator.get_channel_norms()}
+                                  "discriminator_channel_magnitudes": discriminator.get_channel_norms(),
+                                  "decoding_error_history": decoding_error_history}
             }, 'checkpoint.pth.tar')
+
+    # For orion
+    best_accuracy = torch.max(accuracies.mean(dim=0)).item()
+    error_rate = 100 - best_accuracy
+    report_results([dict(
+        name='test_error_rate',
+        type='objective',
+        value=error_rate)])
 
 if __name__ == '__main__':
     args = parser.parse_args()
