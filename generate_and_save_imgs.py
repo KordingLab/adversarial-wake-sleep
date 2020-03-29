@@ -37,7 +37,7 @@ def main(args):
     noise_dim = args.noise_dim
     n_filters = args.n_filters
     cortex = DeterministicHelmholtz(noise_dim, n_filters, 3, noise_type=args.noise_type,
-                                    image_size=image_size)
+                                    image_size=image_size).eval()
 
     _ = load_checkpoint(args.path, cortex)
 

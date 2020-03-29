@@ -922,7 +922,7 @@ def weights_init_he(net):
 
 class AddNoise(nn.Module):
     """
-    Adds some noise with a certain variance.
+    Adds some noise with a certain variance. During evaluation no noise is applied.
 
     noise_type: What sort of noise is applied after each convolutional layer? Gaussian, but of what variance?
             'fixed' = Noise is always Gaussian with variance 0.01
@@ -958,40 +958,48 @@ class AddNoise(nn.Module):
             self.relu = nn.ReLU()
 
     def forward(self, x):
-        if self.noise_type == 'none':
-            out = x
 
-        elif self.noise_type == 'fixed':
-            noise = torch.empty_like(x).normal_()
-            out = x + noise * self.fixed_variance
+        if self.training:
+            if self.noise_type == 'none':
+                out = x
+            elif self.noise_type == 'fixed':
+                noise = torch.empty_like(x).normal_()
+                out = x + noise * self.fixed_variance
 
-        elif self.noise_type == 'learned_by_layer':
-            noise = torch.empty_like(x).normal_()
-            out = x + noise * torch.exp(self.log_sigma)
+            elif self.noise_type == 'learned_by_layer':
+                noise = torch.empty_like(x).normal_()
+                out = x + noise * torch.exp(self.log_sigma)
 
-        elif self.noise_type == 'learned_by_channel':
-            noise = torch.empty_like(x).normal_()
-            out = x + noise * torch.exp(self.log_sigma)[None,:,None,None]
+            elif self.noise_type == 'learned_by_channel':
+                noise = torch.empty_like(x).normal_()
+                out = x + noise * torch.exp(self.log_sigma)[None,:,None,None]
 
+            elif self.noise_type == 'learned_filter':
+                n_channels = x.size()[1]
+                assert n_channels % 2 == 0
+
+                mu = x[:, :n_channels//2,:,:]
+                log_sigma = x[:, n_channels//2:,:,:]
+
+                #rescale log_sigma and shrink. This is just to make the initialization the right scale
+                log_sigma = log_sigma * .01 - 2
+
+                noise = torch.empty_like(mu).normal_()
+                out = mu + noise * torch.exp(log_sigma)
+            elif self.noise_type == 'poisson':
+                noise = torch.empty_like(x).normal_()
+                out = x + noise * self.relu(x) / 10
+            else:
+                raise AssertionError("noise_type not in "
+                                     "['none', 'fixed', 'learned_by_layer', 'learned_by_channel', "
+                                     "'poisson', 'learned_filter']")
         elif self.noise_type == 'learned_filter':
             n_channels = x.size()[1]
             assert n_channels % 2 == 0
-    
-            mu = x[:, :n_channels//2,:,:]
-            log_sigma = x[:, n_channels//2:,:,:]
 
-            #rescale log_sigma and shrink. This is just to make the initialization the right scale
-            log_sigma = log_sigma * .01 - 2
-
-            noise = torch.empty_like(mu).normal_()
-            out = mu + noise * torch.exp(log_sigma)
-        elif self.noise_type == 'poisson':
-            noise = torch.empty_like(x).normal_()
-            out = x + noise * self.relu(x) / 10
+            out = x[:, :n_channels // 2, :, :]
         else:
-            raise AssertionError("noise_type not in "
-                                 "['none', 'fixed', 'learned_by_layer', 'learned_by_channel', "
-                                 "'poisson', 'learned_filter']")
+            out = x
             
         return out
 
