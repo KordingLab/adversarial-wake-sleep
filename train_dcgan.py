@@ -171,13 +171,14 @@ def train(args, cortex, train_loader, discriminator,
         real_samples = Variable(images)
 
         # pass through inference
-        inferred_noise = cortex.inference(real_samples)
+        cortex.inference(real_samples)
 
         cortex.log_layerwise_reconstructions()
 
         # now update generator with the wake-sleep step
         # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
         # with Gaussian we have log p  = MSE between actual and predicted
+        ML_loss = 0
         if args.minimize_generator_surprisal or args.detailed_logging or args.soft_div_norm>0:
             ML_loss = cortex.generator_surprisal()
         if args.minimize_generator_surprisal:
@@ -190,7 +191,7 @@ def train(args, cortex, train_loader, discriminator,
 
         # fantasize
 
-        generated_input = cortex.noise_and_generate(noise_layer)
+        cortex.noise_and_generate(noise_layer)
 
         if args.soft_div_norm > 0:
             div_norm_loss = cortex.get_pixelwise_channel_norms() * args.soft_div_norm
@@ -199,6 +200,9 @@ def train(args, cortex, train_loader, discriminator,
         if args.minimize_inference_surprisal:
             ML_loss = cortex.inference_surprisal()
             ML_loss.backward()
+        if not args.quiet:
+            if batch % 100 == 0:
+                print("Epoch {} Batch {} Overall surprisal {:.2f}".format(epoch, batch, ML_loss.item()))
 
         if args.label_smoothing:
             #with prob .1 we switch the labels
@@ -214,20 +218,18 @@ def train(args, cortex, train_loader, discriminator,
                         nn.ReLU()(1.0 + alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
 
             # train with gradient penalty
-            gradient_penalty = discriminator.get_gradient_penalty(
+            disc_loss += discriminator.get_gradient_penalty(
                 cortex.inference.get_detached_state_dict(),
                 cortex.generator.get_detached_state_dict())
-            disc_loss += gradient_penalty
 
         elif args.loss_type == 'wasserstein':
             disc_loss = -(alpha * discriminator(cortex.inference.get_detached_state_dict())).mean() + \
                          (alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
 
             # train with gradient penalty
-            gradient_penalty = discriminator.get_gradient_penalty(
+            disc_loss += discriminator.get_gradient_penalty(
                 cortex.inference.get_detached_state_dict(),
                 cortex.generator.get_detached_state_dict())
-            disc_loss += gradient_penalty
         else:
             d_inf = discriminator(cortex.inference.get_detached_state_dict())
             d_gen = discriminator(cortex.generator.get_detached_state_dict())
@@ -262,6 +264,7 @@ def train(args, cortex, train_loader, discriminator,
             nn.utils.clip_grad_norm_(discriminator.parameters(),
                                      args.gradient_clipping, "inf")
 
+
         optimizerD.step()
 
         gen_loss.backward()
@@ -273,9 +276,7 @@ def train(args, cortex, train_loader, discriminator,
         optimizerG.step()
         optimizerF.step()
 
-        if not args.quiet:
-            if batch % 100 == 0:
-                print("Epoch {} Batch {} Overall surprisal {:.2f}".format(epoch, batch, ML_loss.item()))
+
 
                 # print("Max cortex gradient {}".format(get_gradient_stats(cortex)))
 
@@ -564,8 +565,8 @@ def main_worker(gpu, ngpus_per_node, args):
                                   "decoding_error_history": decoding_error_history}
             }, 'checkpoint.pth.tar')
 
-    # For orion
-    best_accuracy = torch.max(accuracies.mean(dim=0)).item()
+    # For orion. Don't include lowest layer
+    best_accuracy = torch.max(accuracies.mean(dim=0)[1:]).item()
     error_rate = 100 - best_accuracy
     report_results([dict(
         name='test_error_rate',
