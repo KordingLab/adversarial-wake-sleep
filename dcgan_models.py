@@ -473,7 +473,8 @@ class Discriminator(nn.Module):
     def __init__(self, n_filters, n_img_channels, n_noise_channels, image_size,
                 eval_std_dev = False,
                 log_channel_norms = False,
-                detailed_logging = False):
+                detailed_logging = False,
+                 lambda_ = .5):
         super(Discriminator, self).__init__()
 
         self.relu = nn.LeakyReLU(.2, inplace = True)
@@ -489,21 +490,25 @@ class Discriminator(nn.Module):
                                      nn.Conv2d(n_filters*2, n_filters*2, 4, 2, 1),
                                      nn.Conv2d(n_filters*4, n_filters*4, 4, 2, 1),
                                      nn.Conv2d(n_filters*8, n_filters*8, 4, 2, 1),
-                                     nn.Conv2d(n_filters*16 + plus1, n_noise_channels, last_kernel, 1, 0)])
+                                     nn.Conv2d(n_filters*16 + plus1, n_noise_channels, last_kernel, 1, 0),
+                                     nn.Conv2d(n_noise_channels*2,1, 1, 1, 0)])
 
-        self.log_channel_norms = log_channel_norms
-        self.detailed_logging = detailed_logging
-        self.channel_norms = {layer: [] for layer in range(5)}
         self.current_channel_norms = {}
         self.mse = nn.MSELoss()
-
+        self.lambda_ = lambda_
 
         self.apply(weights_init)
+
+        # logging
+        self.intermediate_Ds = []
+        self.log_channel_norms = log_channel_norms
+        self.detailed_logging = detailed_logging
+        self.channel_norms = {layer: [] for layer in range(6)}
 
 
 
     def forward(self, intermediate_state_dict, detach = False):
-        layer_names = intermediate_state_dict.keys()
+        layer_names = list(intermediate_state_dict.keys())
 
         # intermediate layers
         x = intermediate_state_dict[layer_names[0]].detach() if detach else intermediate_state_dict[layer_names[0]]
@@ -519,7 +524,7 @@ class Discriminator(nn.Module):
 
             x = layer(x)
             # don't relu the last layer
-            if i<4:
+            if i<5:
                 x = self.relu(x)
 
             if self.log_channel_norms:
@@ -527,8 +532,10 @@ class Discriminator(nn.Module):
                 self.current_channel_norms[i] = n
                 if self.detailed_logging:
                     self.channel_norms[i].append(n.mean().item())
+        if self.detailed_logging:
+            self.intermediate_Ds.append(x.mean().item())
 
-        return x
+        return x.view(-1,1)
 
     def get_channel_norm(self, x):
         return (((x**2).mean(dim=1) + 1e-8).sqrt())
@@ -544,8 +551,8 @@ class Discriminator(nn.Module):
         interpolated_dict = OrderedDict()
         for (_, estate), (layer,gstate) in zip(inference_state_dict.items(), generator_state_dict.items()):
 
-            interpolated_dict[layer] = Variable(alpha_spherical_interpolate(estate.detach(), gstate.detach()),
-                                                requres_grad = True)
+            interp = alpha_spherical_interpolate(estate.detach(), gstate.detach())
+            interpolated_dict[layer] = Variable(interp, requires_grad = True)
 
         gp = calc_gradient_penalty(self, interpolated_dict, LAMBDA=self.lambda_)
 

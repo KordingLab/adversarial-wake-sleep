@@ -20,7 +20,6 @@ import os
 import random
 import warnings
 
-from orion.client import report_results
 from classify_from_model import decode_classes_from_layers
 
 parser = argparse.ArgumentParser(description='PyTorch Adversarial Wake-Sleep Training on MNIST')
@@ -116,11 +115,7 @@ parser.add_argument('--historical-averaging',  default=0, type=float,
 parser.add_argument('--minibatch-std-dev', action='store_true',
                     help='Evaluate the standard deviation of the features in the 2nd-to-last layer of the discriminator'
                     ' and add it as a feature. As in progressiveGAN.')
-parser.add_argument('--avg-after-n-layers', default=0, type=int,
-                    help="""convolve this many layers and, if this many layers doesn't shrink the
-                            x and y dimensions to 1, just average over the x and y channels instead of continuing
-                            to convolve down. Designed to prevent lower-layer discriminators from learning to
-                            discriminate global image structure. Not used if set to False.""")
+
 parser.add_argument('--divisive-normalization', action='store_true',
                     help='Divisive normalization over channels, pixel by pixel. As in ProgressiveGANs')
 parser.add_argument('--soft-div-norm', default=0, type=float,
@@ -132,9 +127,7 @@ parser.add_argument('--gradient-clipping', default=0, type=float,
                     help="CLip gradients on everything at this value")
 parser.add_argument('--amsgrad', action='store_true',
                     help="Use AMSgrad?")
-parser.add_argument('--learn_variance', action='store_true',
-                    help="As in variational autoencoders, add Gaussian noise of a variance which is learned. "
-                    "a.k.a. the reparameterization trick.")
+
 
 
 def train(args, cortex, train_loader, discriminator,
@@ -389,7 +382,6 @@ def main_worker(gpu, ngpus_per_node, args):
     bp_thru_gen = (not args.no_backprop_through_full_cortex)
 
     bn = False if args.loss_type == 'wasserstein' else True
-    avg_after_n_layers = False if args.avg_after_n_layers<2 else args.avg_after_n_layers
 
 
     cortex = DeterministicHelmholtz(args.noise_dim, args.n_filters, nc,
@@ -403,15 +395,11 @@ def main_worker(gpu, ngpus_per_node, args):
                                     normalize = args.divisive_normalization,
                                     he_init=args.he_initialization)
 
-    discriminator = Discriminator(image_size, cortex.layer_names,
-                                  args.noise_dim, args.n_filters, nc,
-                                  lambda_=args.lamda, loss_type=args.loss_type,
-                                  log_intermediate_Ds=args.detailed_logging or (args.soft_div_norm>0),
-                                  avg_after_n_layers=avg_after_n_layers,
-                                  eval_std_dev = args.minibatch_std_dev,
-                                  normalize=args.divisive_normalization,
-                                  he_init=args.he_initialization,
-                                  detailed_logging=args.detailed_logging)
+    discriminator = Discriminator(args.n_filters, nc, args.noise_dim, image_size,
+                eval_std_dev = args.minibatch_std_dev,
+                log_channel_norms = args.detailed_logging or (args.soft_div_norm>0),
+                detailed_logging = args.detailed_logging,
+                lambda_=args.lamda)
 
     # get to proper GPU
     if args.distributed:
@@ -555,7 +543,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                   "reconstructions": cortex.intermediate_reconstructions,
                                   "weight_alignment": cortex.weight_alignment,
                                   "cortex_channel_magnitudes": cortex.channel_norms,
-                                  "discriminator_channel_magnitudes": discriminator.get_channel_norms(),
+                                  "discriminator_channel_magnitudes": discriminator.channel_norms,
                                   "decoding_error_history": decoding_error_history}
             }, 'checkpoint.pth.tar')
 
