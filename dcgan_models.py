@@ -455,179 +455,78 @@ class null(nn.Module):
     def forward(self, x):
         return x
 
-class DiscriminatorFactorFC(nn.Module):
-    """To discriminate between two full-connected layers"""
+class Discriminator(nn.Module):
+    """To discriminate between full network states.
+    The network hidden states are concatenated
 
-    def __init__(self, input_size, hidden_size, with_sigmoid=False, batchnorm = True, eval_std_dev = False,
-                 he_init = False):
-        super(DiscriminatorFactorFC, self).__init__()
-        self.hidden_size = hidden_size
-        self.input_size = input_size
-        self.he_init = he_init
-
-        self.eval_std_dev = eval_std_dev
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.relu = nn.LeakyReLU()
-        d= 1 if eval_std_dev else 0
-        self.fc2 = nn.Linear(hidden_size+d, 1)
-        self.bn = nn.BatchNorm1d(hidden_size) if batchnorm else null()
-        self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null()
-
-    def forward(self, h1, h2):
-        # reshape
-        h2 = h2.view(h2.size()[0], -1)
-        h1 = h1.view(h1.size()[0], -1)
-
-        x = torch.cat([h1, h2], dim=1)
-
-        out = self.fc1(x)
-        out = self.bn(out)
-        out = self.relu(out)
-        #He rescale
-        if self.he_init:
-            out = out * math.sqrt(2./ self.input_size)
+    x     h1     h2     h3     h4     h5
+    |     |      |      |      |      |
+    +-c1--+--c2--+--c3--+--c4--+--c5--+--c6--> output
 
 
-        if self.eval_std_dev:
-            sd = torch.mean(torch.sqrt(torch.var(out,0)+1e-8))
-            to_cat = torch.ones(out.size()[0],1).to(out.device) * sd
-            out = torch.cat([out, to_cat], dim=1)
-
-        out = self.fc2(out)
-        #He rescale
-        if self.he_init:
-            out = out * math.sqrt(2./ self.hidden_size)
-
-        out = self.out_nonlinearity(out)
-
-        return out
-
-
-class DiscriminatorFactorConv(nn.Module):
-    """To discriminate between two layers separated by a convolutional operation.
-
-    This module programatically generates a multilayer convolutional network with N layers. Since each layer
-    halves the x and y dimension, the number of layers N is log2( dim_x_y ). For this reason
-    the dimension must be supplied when constructing.
-
-
-
-    INPUTS
-    [conv_kernel, conv_stride, conv_pad] = the parameters of the Conv2d in the inference operation between
-    the two layers (or equivalently the ConvTranspose2d of the generator)
-
-    inner_channels_per_layer: how many hidden dimension channels (doubles as you go up the disc).
-    dim_x_y: Size of the square array in the *bottom* layer. Must be divisible by 4.
-
-    with_sigmoid = Boolean. Whether to apply a sigmoid to the output of each inner Discriminator, as required when
-                        averaging (ensembling) multiple discriminators in a standard GAN with BCELoss
-    avg_after_n_layers = Int > 1 (or False): convolve this many layers and, if this many layers doesn't shrink the
-                            x and y dimensions to 1, just average over the x and y channels instead of continuing
-                            to convolve down. Designed to prevent lower-layer discriminators from learning to
-                            discriminate global image structure. Not used if set to False.
-    eval_std_dev: Boolean. Calculate the std deviation of the 2nd-to-last layer(the pre-logit)  in this disciminator,
-                            and use that for the decision.
+    n_filters = number of filters in the first layer of E/G. assumes this doubles each layer
+    n_img_channels = number of color channels in the input
+    n_noise_channels = dimensionality of h5
 
     """
 
-    def __init__(self, h1_channels, h2_channels,
-                 dim_x_y,
-                 avg_after_n_layers = False, eval_std_dev = False,
-                 with_sigmoid=False,
-                 batchnorm = True,
-                 normalize = False,
-                 log_channel_norms = False,
-                 detailed_logging = False,
-                 he_init = False):
-        super(DiscriminatorFactorConv, self).__init__()
-        self.he_init = he_init
-        assert dim_x_y % 4 == 0
-        self.dim_x_y=dim_x_y
-        n_inter_layers = 0 if (dim_x_y==4) else int(math.log2(dim_x_y//4))
-
-        # handle the averaging operation
-        self.avg_after_n_layers = avg_after_n_layers
-        if avg_after_n_layers is not False:
-            assert avg_after_n_layers > 0
-            n_inter_layers = min(n_inter_layers, avg_after_n_layers-1)
-        else:
-            avg_after_n_layers = 0
+    def __init__(self, n_filters, n_img_channels, n_noise_channels, image_size,
+                eval_std_dev = False,
+                log_channel_norms = False,
+                detailed_logging = False):
+        super(Discriminator, self).__init__()
 
         self.relu = nn.LeakyReLU(.2, inplace = True)
 
-        inner_channels_per_layer = (h1_channels+h2_channels)
-
-        ## Then we pare down this combined hidden state to a logit.
-        # The last layer is always kernel=4, stride = 0.
-        # we intersperse a number of size-halving layers in between depending on the original size.
-        # the number of channels doubles with each layer.
-        self.mid_disc_layers = nn.ModuleList([nn.Sequential(nn.Conv2d((2 ** i) * inner_channels_per_layer,
-                                                                      (2 ** (i+1)) * inner_channels_per_layer,
-                                                                      4,2,1),
-                                                            MaybeHeRescale((2 ** i) * inner_channels_per_layer, 4,
-                                                                           rescale=he_init),
-                                                            nn.BatchNorm2d(inner_channels_per_layer * (2 ** (i+1))) if batchnorm else null(),
-                                                            nn.LeakyReLU(.2, inplace=True),
-                                                            NormalizationLayer() if normalize else null())
-                                                for i in range(n_inter_layers)])
-
-        n_final_dims = (2 ** n_inter_layers) * inner_channels_per_layer
 
         self.eval_std_dev = eval_std_dev
-        if eval_std_dev:
-            n_final_dims += 1
+        plus1 = 1 if eval_std_dev else 0
 
-        #if we're averaging over many decisions of a convolved sub-discriminator,
-        # that is if the n_inter_layers was greater than the number of layers before averaging,
-        # we want the kernel to be 1. else it's 4.
-        if n_inter_layers > avg_after_n_layers-1:
-            self.last_disc_layer = nn.Conv2d(n_final_dims, 1, 4, 1, 0)
-        else:
-            self.last_disc_layer = nn.Conv2d(n_final_dims, 1, 1, 1, 0)
+        last_kernel = 4 if image_size==64 else 2
 
 
-        self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null()
+        self.layers = nn.ModuleList([nn.Conv2d(n_img_channels, n_filters, 4, 2, 1),
+                                     nn.Conv2d(n_filters*2, n_filters*2, 4, 2, 1),
+                                     nn.Conv2d(n_filters*4, n_filters*4, 4, 2, 1),
+                                     nn.Conv2d(n_filters*8, n_filters*8, 4, 2, 1),
+                                     nn.Conv2d(n_filters*16 + plus1, n_noise_channels, last_kernel, 1, 0)])
 
         self.log_channel_norms = log_channel_norms
         self.detailed_logging = detailed_logging
-        self.channel_norms = {layer: [] for layer in range(n_inter_layers)}
+        self.channel_norms = {layer: [] for layer in range(5)}
         self.current_channel_norms = {}
         self.mse = nn.MSELoss()
 
 
-    def forward(self, h1, h2):
-        #size check
-        s = h1.size()[2]
-        assert s == self.dim_x_y
-        # combine lower and upsampled layers into a single block
-        upsampled_h2 = nn.functional.interpolate(h2, size=(s,s), mode='nearest')
+        self.apply(weights_init)
 
-        x = torch.cat([h1, upsampled_h2], dim=1)
+
+
+    def forward(self, intermediate_state_dict, detach = False):
+        layer_names = intermediate_state_dict.keys()
 
         # intermediate layers
-        for i, layer in enumerate(self.mid_disc_layers):
+        x = intermediate_state_dict[layer_names[0]].detach() if detach else intermediate_state_dict[layer_names[0]]
+        for i, layer in enumerate(self.layers):
+            if i>0:
+                x = torch.cat([x,
+                               intermediate_state_dict[layer_names[i]].detach() if detach
+                                    else intermediate_state_dict[layer_names[i]]],dim=1)
+
+            # maybe get std dev over batch
+            if self.eval_std_dev and i==4:
+                x = stdDev(x)
+
             x = layer(x)
+            # don't relu the last layer
+            if i<4:
+                x = self.relu(x)
 
             if self.log_channel_norms:
                 n = self.get_channel_norm(x)
                 self.current_channel_norms[i] = n
                 if self.detailed_logging:
                     self.channel_norms[i].append(n.mean().item())
-
-        # maybe get std dev over batch
-        if self.eval_std_dev:
-            x = stdDev(x)
-
-        #last layer
-        x = self.last_disc_layer(x)
-        x = x * (getLayerNormalizationFactor(self.last_disc_layer) if self.he_init else 1)
-
-
-        # finally, maybe, apply a sigmoid nonlinearity
-        x = self.out_nonlinearity(x)
-
-        if self.avg_after_n_layers:
-            x = x.mean(dim=3).mean(dim=2)
 
         return x
 
@@ -639,6 +538,18 @@ class DiscriminatorFactorConv(nn.Module):
         for layer, state in self.current_channel_norms.items():
             total_dist = total_dist + self.mse(state, torch.ones_like(state))
         return total_dist
+
+    def get_gradient_penalty(self, inference_state_dict, generator_state_dict):
+
+        interpolated_dict = OrderedDict()
+        for (_, estate), (layer,gstate) in zip(inference_state_dict.items(), generator_state_dict.items()):
+
+            interpolated_dict[layer] = Variable(alpha_spherical_interpolate(estate.detach(), gstate.detach()),
+                                                requres_grad = True)
+
+        gp = calc_gradient_penalty(self, interpolated_dict, LAMBDA=self.lambda_)
+
+        return gp
 
 
 def stdDev(x):
@@ -661,153 +572,26 @@ def stdDev(x):
     return torch.cat([x, y], dim=1)
 
 
-class Discriminator(nn.Module):
-    """To discriminate between the full network state.
 
-    Note: when calling, it takes a full dictionary of states.
-
-    Inputs: full_architecture: a list of sizes [Input, hidden1, hidden2, z_dim]
-            layer_names: a list of the names of the layers in the state_dict
-            hidden_layer_size: the size of the hidden layer each discriminator
-            lambda_: when using WGAN-GP, the size of the GP
-            loss_type: a string. If `BCE`, then we apply a sigmoid to each sub-discriminator before averaging."""
-
-    def __init__(self, image_size, layer_names,
-                 noise_dim, n_filters, n_img_channels,
-                 lambda_=0, loss_type='wasserstein',
-                 log_intermediate_Ds=False,
-                 eval_std_dev=False,
-                 avg_after_n_layers=False,
-                 normalize = False,
-                 he_init = False,
-                 detailed_logging = False):
-        super(Discriminator, self).__init__()
-
-        self.layer_names = layer_names
-        self.lambda_ = lambda_
-
-
-        with_sigmoid = loss_type == 'BCE'
-        batchnorm = not loss_type == "wasserstein"
-
-        kw_args = {"with_sigmoid": with_sigmoid,
-                   "batchnorm": batchnorm,
-                   "eval_std_dev": eval_std_dev,
-                   "avg_after_n_layers": avg_after_n_layers,
-                   "normalize":normalize,
-                   "log_channel_norms": log_intermediate_Ds,
-                   "he_init":he_init,
-                   "detailed_logging": detailed_logging}
-
-        self.discriminator_0and1 = DiscriminatorFactorConv(n_img_channels, n_filters,
-                                                           dim_x_y=image_size,
-                                                           **kw_args)
-        self.discriminator_1and2 = DiscriminatorFactorConv(n_filters, n_filters * 2,
-                                                           dim_x_y=image_size//2,
-                                                           **kw_args)
-        self.discriminator_2and3 = DiscriminatorFactorConv(n_filters * 2, n_filters * 4,
-                                                           dim_x_y=image_size//4,
-                                                           **kw_args)
-        self.discriminator_3and4 = DiscriminatorFactorConv(n_filters * 4, n_filters * 8,
-                                                           dim_x_y=image_size//8,
-                                                           **kw_args)
-        self.discriminator_4and5 = DiscriminatorFactorFC((image_size //16)** 2 * n_filters * 8 +
-                                                          noise_dim,
-                                                          noise_dim*2,
-                                                          with_sigmoid,
-                                                          batchnorm=batchnorm,
-                                                          eval_std_dev = eval_std_dev,
-                                                          he_init=he_init)
-
-        self.Ds = [self.discriminator_0and1, self.discriminator_1and2,
-                   self.discriminator_2and3, self.discriminator_3and4, self.discriminator_4and5]
-
-        self.which_layers = 'all'
-
-        # init
-        if he_init:
-            self.apply(weights_init_he)
-        else:
-            self.apply(weights_init)
-
-        # logging
-        self.log_intermediate_Ds = log_intermediate_Ds
-        self.intermediate_Ds = {layer: [] for layer in self.layer_names}
-
-    def get_total_channel_norm_dist_from_1(self):
-        """Gets the total distance from 1 of the pixel-wise norm over channels. """
-        total_dist = 0
-        for D in self.Ds[:4]:
-            total_dist = total_dist + D.get_channel_norm_dist_from_1()
-        return total_dist
-
-    def get_channel_norms(self):
-        return {i: D.channel_norms for i, D in enumerate(self.Ds[:4])}
-
-    def forward(self, network_state_dict):
-        """
-
-        """
-        if self.which_layers == 'all':
-            self.which_layers = range(len(self.Ds))
-
-        d = 0
-        for i, D in enumerate(self.Ds):
-            if i not in self.which_layers:
-                continue
-
-            h1 = network_state_dict[self.layer_names[i]]
-            h2 = network_state_dict[self.layer_names[i + 1]]
-
-            this_d = D(h1, h2).view(-1, 1)
-            d = d + this_d
-
-            if self.log_intermediate_Ds:
-                self.intermediate_Ds[self.layer_names[i]].append(this_d.mean().item())
-
-        return d / float(len(self.Ds))
-
-    def get_gradient_penalty(self, inference_state_dict, generator_state_dict):
-
-        gp = 0
-        for i, D in enumerate(self.Ds):
-            if i not in self.which_layers:
-                continue
-
-            h1i = inference_state_dict[self.layer_names[i]].detach()
-            h2i = inference_state_dict[self.layer_names[i + 1]].detach()
-
-            h1g = generator_state_dict[self.layer_names[i]].detach()
-            h2g = generator_state_dict[self.layer_names[i + 1]].detach()
-
-            gp = gp + calc_gradient_penalty(D, (h1i, h2i), (h1g, h2g), LAMBDA=self.lambda_)
-
-        return gp / float(len(self.Ds))
-
-
-def calc_gradient_penalty(netD, real_data_tuple, fake_data_tuple, LAMBDA=.1):
+def calc_gradient_penalty(netD, interpolated_dict, LAMBDA=.1):
     """A general utility function modified from a WGAN-GP implementation.
 
     Not pretty rn; TODO make prettier"""
 
-    batch_size = real_data_tuple[0].size()[0]
+    d = interpolated_dict["Input"].device
+    bs = interpolated_dict["Input"].size(0)
 
-    interpolates0 = alpha_spherical_interpolate(real_data_tuple[0], fake_data_tuple[0])
-    interpolates0 = Variable(interpolates0, requires_grad=True)
+    disc_interpolates = netD(interpolated_dict)
 
-    interpolates1 = alpha_spherical_interpolate(real_data_tuple[1], fake_data_tuple[1])
-    interpolates1 = Variable(interpolates1, requires_grad=True)
-
-    disc_interpolates = netD(interpolates0, interpolates1)
-
-    gradients0, gradients1 = grad(outputs=disc_interpolates, inputs=[interpolates0, interpolates1],
-                                  grad_outputs=torch.ones(disc_interpolates.size()).to(real_data_tuple[0].device),
+    gradients = grad(outputs=disc_interpolates,
+                                  inputs=[t for (_,t) in interpolated_dict.items()],
+                                  grad_outputs=torch.ones(disc_interpolates.size()).to(d),
                                   create_graph=True, retain_graph=True, only_inputs=True)
 
-    gradients0, gradients1 = gradients0.view(batch_size, -1), gradients1.view(batch_size, -1)
+    gradient_norms = [(g.view(bs, -1).norm(2, dim=1) - 1) ** 2 for g in gradients]
 
-    gradient_penalty = ((gradients0.norm(2, dim=1) - 1) ** 2 +
-                        (gradients1.norm(2, dim=1) - 1) ** 2).mean() * LAMBDA
+    gradient_penalty = sum(gradient_norms).mean() * LAMBDA
+
     return gradient_penalty
 
 

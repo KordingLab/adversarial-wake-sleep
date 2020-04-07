@@ -214,25 +214,25 @@ def train(args, cortex, train_loader, discriminator,
 
         # check out what the discriminator says
         if args.loss_type == 'hinge':
-            disc_loss = nn.ReLU()(1.0 - alpha * discriminator(cortex.inference.get_detached_state_dict())).mean() + \
-                        nn.ReLU()(1.0 + alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
+            disc_loss = nn.ReLU()(1.0 - alpha * discriminator(cortex.inference.intermediate_state_dict, detach=True)).mean() + \
+                        nn.ReLU()(1.0 + alpha * discriminator(cortex.generator.intermediate_state_dict, detach=True)).mean()
 
             # train with gradient penalty
             disc_loss += discriminator.get_gradient_penalty(
-                cortex.inference.get_detached_state_dict(),
-                cortex.generator.get_detached_state_dict())
+                cortex.inference.intermediate_state_dict,
+                cortex.generator.intermediate_state_dict)
 
         elif args.loss_type == 'wasserstein':
-            disc_loss = -(alpha * discriminator(cortex.inference.get_detached_state_dict())).mean() + \
-                         (alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
+            disc_loss = -(alpha * discriminator(cortex.inference.intermediate_state_dict, detach=True)).mean() + \
+                         (alpha * discriminator(cortex.generator.intermediate_state_dict, detach=True)).mean()
 
             # train with gradient penalty
             disc_loss += discriminator.get_gradient_penalty(
-                cortex.inference.get_detached_state_dict(),
-                cortex.generator.get_detached_state_dict())
+                cortex.inference.intermediate_state_dict,
+                cortex.generator.intermediate_state_dict)
         else:
-            d_inf = discriminator(cortex.inference.get_detached_state_dict())
-            d_gen = discriminator(cortex.generator.get_detached_state_dict())
+            d_inf = discriminator(cortex.inference.intermediate_state_dict, detach=True)
+            d_gen = discriminator(cortex.generator.intermediate_state_dict, detach=True)
 
             p = .9 if args.label_smoothing else 1
 
@@ -243,7 +243,7 @@ def train(args, cortex, train_loader, discriminator,
             disc_loss = disc_loss + ha_loss(discriminator)
 
         if args.soft_div_norm > 0:
-            disc_loss = disc_loss + args.soft_div_norm * discriminator.get_total_channel_norm_dist_from_1()
+            disc_loss = disc_loss + args.soft_div_norm * discriminator.get_channel_norm_dist_from_1()
 
         # now update the inference and generator to fight the discriminator
 
@@ -264,9 +264,8 @@ def train(args, cortex, train_loader, discriminator,
             nn.utils.clip_grad_norm_(discriminator.parameters(),
                                      args.gradient_clipping, "inf")
 
-
         optimizerD.step()
-
+        # this comes after because running backward will put gradients into the leaves of D that we don't want to follow
         gen_loss.backward()
         # Clip gradients?
         if args.gradient_clipping > 0:
@@ -275,11 +274,6 @@ def train(args, cortex, train_loader, discriminator,
                                      args.gradient_clipping, "inf")
         optimizerG.step()
         optimizerF.step()
-
-
-
-                # print("Max cortex gradient {}".format(get_gradient_stats(cortex)))
-
 
 
 def main(args):
