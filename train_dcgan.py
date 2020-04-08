@@ -132,9 +132,8 @@ parser.add_argument('--gradient-clipping', default=0, type=float,
                     help="CLip gradients on everything at this value")
 parser.add_argument('--amsgrad', action='store_true',
                     help="Use AMSgrad?")
-parser.add_argument('--learn_variance', action='store_true',
-                    help="As in variational autoencoders, add Gaussian noise of a variance which is learned. "
-                    "a.k.a. the reparameterization trick.")
+parser.add_argument('--spectral-norm', action='store_true',
+                    help='Apply spectral norm to the discriminator')
 
 
 def train(args, cortex, train_loader, discriminator,
@@ -417,7 +416,8 @@ def main_worker(gpu, ngpus_per_node, args):
                                   eval_std_dev = args.minibatch_std_dev,
                                   normalize=args.divisive_normalization,
                                   he_init=args.he_initialization,
-                                  detailed_logging=args.detailed_logging)
+                                  detailed_logging=args.detailed_logging,
+                                  spectral_norm=args.spectral_norm)
 
     # get to proper GPU
     if args.distributed:
@@ -455,21 +455,17 @@ def main_worker(gpu, ngpus_per_node, args):
 
 
     # ------ Build optimizer ------ #
-    if isinstance(cortex, torch.nn.parallel.DistributedDataParallel):
-        generator_params = cortex.module.generator.parameters()
-        inference_params = cortex.module.inference.parameters()
-        discriminator_params = discriminator.parameters()
-    else:
-        generator_params = cortex.generator.parameters()
-        inference_params = cortex.inference.parameters()
-        discriminator_params = discriminator.parameters()
-
-    optimizerD = optim.Adam(discriminator_params, lr=args.lr_d, betas=(args.beta1, 0.999), weight_decay = args.wd,
+    optimizerD = optim.Adam(discriminator.parameters(), lr=args.lr_d, betas=(args.beta1, 0.999), weight_decay = args.wd,
                                                                                            amsgrad = args.amsgrad)
-    optimizerG = optim.Adam(generator_params,     lr=args.lr_g, betas=(args.beta1, 0.999), weight_decay = args.wd,
-                                                                                            amsgrad = args.amsgrad)
-    optimizerF = optim.Adam(inference_params,     lr=args.lr_e, betas=(args.beta1, 0.999), weight_decay = args.wd,
-                                                                                            amsgrad = args.amsgrad)
+    # we want the lr to be slower for upper layers as they get more gradient flow
+    optimizerG = optim.Adam([{'params':mod.parameters(),'lr': args.lr_g * (5-i)}
+                                    for i,mod in enumerate(cortex.generator.listed_modules)],
+                     lr=args.lr_g, betas=(args.beta1, 0.999), weight_decay = args.wd,amsgrad = args.amsgrad)
+
+    # similarly for the encoder lower layers show have slower lrs
+    optimizerF = optim.Adam([{'params':mod.parameters(),'lr': args.lr_e * (i+1)}
+                                    for i,mod in enumerate(cortex.inference.listed_modules)],
+                     lr=args.lr_e, betas=(args.beta1, 0.999), weight_decay = args.wd,amsgrad = args.amsgrad)
 
     # ------ optionally resume from a checkpoint ------- #
     if args.resume:

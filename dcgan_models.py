@@ -459,17 +459,22 @@ class DiscriminatorFactorFC(nn.Module):
     """To discriminate between two full-connected layers"""
 
     def __init__(self, input_size, hidden_size, with_sigmoid=False, batchnorm = True, eval_std_dev = False,
-                 he_init = False):
+                 he_init = False, spectral_norm = False):
         super(DiscriminatorFactorFC, self).__init__()
         self.hidden_size = hidden_size
         self.input_size = input_size
         self.he_init = he_init
-
-        self.eval_std_dev = eval_std_dev
-        self.fc1 = nn.Linear(input_size, hidden_size)
         self.relu = nn.LeakyReLU()
         d= 1 if eval_std_dev else 0
-        self.fc2 = nn.Linear(hidden_size+d, 1)
+        self.eval_std_dev = eval_std_dev
+
+        if spectral_norm:
+            self.fc1 = nn.utils.spectral_norm(nn.Linear(input_size, hidden_size))
+            self.fc2 = nn.utils.spectral_norm(nn.Linear(hidden_size+d, 1))
+        else:
+            self.fc1 = nn.Linear(input_size, hidden_size)
+            self.fc2 = nn.Linear(hidden_size + d, 1)
+
         self.bn = nn.BatchNorm1d(hidden_size) if batchnorm else null()
         self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null()
 
@@ -486,7 +491,6 @@ class DiscriminatorFactorFC(nn.Module):
         #He rescale
         if self.he_init:
             out = out * math.sqrt(2./ self.input_size)
-
 
         if self.eval_std_dev:
             sd = torch.mean(torch.sqrt(torch.var(out,0)+1e-8))
@@ -538,7 +542,8 @@ class DiscriminatorFactorConv(nn.Module):
                  normalize = False,
                  log_channel_norms = False,
                  detailed_logging = False,
-                 he_init = False):
+                 he_init = False,
+                 spectral_norm = False):
         super(DiscriminatorFactorConv, self).__init__()
         self.he_init = he_init
         assert dim_x_y % 4 == 0
@@ -561,9 +566,13 @@ class DiscriminatorFactorConv(nn.Module):
         # The last layer is always kernel=4, stride = 0.
         # we intersperse a number of size-halving layers in between depending on the original size.
         # the number of channels doubles with each layer.
-        self.mid_disc_layers = nn.ModuleList([nn.Sequential(nn.Conv2d((2 ** i) * inner_channels_per_layer,
+        self.mid_disc_layers = nn.ModuleList([nn.Sequential(nn.utils.spectral_norm(nn.Conv2d((2 ** i) * inner_channels_per_layer,
                                                                       (2 ** (i+1)) * inner_channels_per_layer,
-                                                                      4,2,1),
+                                                                      4,2,1))
+                                                            if spectral_norm else
+                                                              nn.Conv2d((2 ** i) * inner_channels_per_layer,
+                                                              (2 ** (i + 1)) * inner_channels_per_layer,
+                                                              4, 2, 1),
                                                             MaybeHeRescale((2 ** i) * inner_channels_per_layer, 4,
                                                                            rescale=he_init),
                                                             nn.BatchNorm2d(inner_channels_per_layer * (2 ** (i+1))) if batchnorm else null(),
@@ -581,9 +590,12 @@ class DiscriminatorFactorConv(nn.Module):
         # that is if the n_inter_layers was greater than the number of layers before averaging,
         # we want the kernel to be 1. else it's 4.
         if n_inter_layers > avg_after_n_layers-1:
-            self.last_disc_layer = nn.Conv2d(n_final_dims, 1, 4, 1, 0)
+            k = 4
         else:
-            self.last_disc_layer = nn.Conv2d(n_final_dims, 1, 1, 1, 0)
+            k = 1
+
+        self.last_disc_layer = nn.utils.spectral_norm(nn.Conv2d(n_final_dims, 1, k, 1, 0)) if spectral_norm else \
+                                                      nn.Conv2d(n_final_dims, 1, k, 1, 0)
 
 
         self.out_nonlinearity = nn.Sigmoid() if with_sigmoid else null()
@@ -680,7 +692,8 @@ class Discriminator(nn.Module):
                  avg_after_n_layers=False,
                  normalize = False,
                  he_init = False,
-                 detailed_logging = False):
+                 detailed_logging = False,
+                 spectral_norm = False):
         super(Discriminator, self).__init__()
 
         self.layer_names = layer_names
@@ -697,7 +710,8 @@ class Discriminator(nn.Module):
                    "normalize":normalize,
                    "log_channel_norms": log_intermediate_Ds,
                    "he_init":he_init,
-                   "detailed_logging": detailed_logging}
+                   "detailed_logging": detailed_logging,
+                   "spectral_norm":spectral_norm}
 
         self.discriminator_0and1 = DiscriminatorFactorConv(n_img_channels, n_filters,
                                                            dim_x_y=image_size,
@@ -717,7 +731,8 @@ class Discriminator(nn.Module):
                                                           with_sigmoid,
                                                           batchnorm=batchnorm,
                                                           eval_std_dev = eval_std_dev,
-                                                          he_init=he_init)
+                                                          he_init=he_init,
+                                                          spectral_norm = spectral_norm)
 
         self.Ds = [self.discriminator_0and1, self.discriminator_1and2,
                    self.discriminator_2and3, self.discriminator_3and4, self.discriminator_4and5]
@@ -780,7 +795,7 @@ class Discriminator(nn.Module):
             h1g = generator_state_dict[self.layer_names[i]].detach()
             h2g = generator_state_dict[self.layer_names[i + 1]].detach()
 
-            gp = gp + calc_gradient_penalty(D, (h1i, h2i), (h1g, h2g), LAMBDA=self.lambda_)
+            gp = gp + (i+1) * calc_gradient_penalty(D, (h1i, h2i), (h1g, h2g), LAMBDA=self.lambda_)
 
         return gp / float(len(self.Ds))
 
