@@ -474,7 +474,8 @@ class Discriminator(nn.Module):
                 eval_std_dev = False,
                 log_channel_norms = False,
                 detailed_logging = False,
-                 lambda_ = .5):
+                 lambda_ = .5,
+                 spectral_norm = False):
         super(Discriminator, self).__init__()
 
         self.relu = nn.LeakyReLU(.2, inplace = True)
@@ -485,8 +486,16 @@ class Discriminator(nn.Module):
 
         last_kernel = 4 if image_size==64 else 2
 
-
-        self.layers = nn.ModuleList([nn.Conv2d(n_img_channels, n_filters, 4, 2, 1),
+        if spectral_norm:
+            self.layers = nn.ModuleList([nn.utils.spectral_norm(nn.Conv2d(n_img_channels, n_filters, 4, 2, 1)),
+                                         nn.utils.spectral_norm(nn.Conv2d(n_filters*2, n_filters*2, 4, 2, 1)),
+                                         nn.utils.spectral_norm(nn.Conv2d(n_filters*4, n_filters*4, 4, 2, 1)),
+                                         nn.utils.spectral_norm(nn.Conv2d(n_filters*8, n_filters*8, 4, 2, 1)),
+                                         nn.utils.spectral_norm(nn.Conv2d(n_filters*16 + plus1, n_noise_channels,
+                                                                          last_kernel, 1, 0)),
+                                         nn.utils.spectral_norm(nn.Conv2d(n_noise_channels*2,1, 1, 1, 0))])
+        else:
+            self.layers = nn.ModuleList([nn.Conv2d(n_img_channels, n_filters, 4, 2, 1),
                                      nn.Conv2d(n_filters*2, n_filters*2, 4, 2, 1),
                                      nn.Conv2d(n_filters*4, n_filters*4, 4, 2, 1),
                                      nn.Conv2d(n_filters*8, n_filters*8, 4, 2, 1),
@@ -546,15 +555,24 @@ class Discriminator(nn.Module):
             total_dist = total_dist + self.mse(state, torch.ones_like(state))
         return total_dist
 
+    def detach_and_variable(self,state_dict):
+        d = OrderedDict()
+        for (layer,state) in state_dict.items():
+
+            d[layer] = Variable(state.detach(), requires_grad = True)
+        return d
+
     def get_gradient_penalty(self, inference_state_dict, generator_state_dict):
 
-        interpolated_dict = OrderedDict()
-        for (_, estate), (layer,gstate) in zip(inference_state_dict.items(), generator_state_dict.items()):
 
-            interp = alpha_spherical_interpolate(estate.detach(), gstate.detach())
-            interpolated_dict[layer] = Variable(interp, requires_grad = True)
+        # interpolated_dict = OrderedDict()
+        # for (_, estate), (layer,gstate) in zip(inference_state_dict.items(), generator_state_dict.items()):
+        #
+        #     interp = alpha_spherical_interpolate(estate.detach(), gstate.detach())
+        #     interpolated_dict[layer] = Variable(interp, requires_grad = True)
 
-        gp = calc_gradient_penalty(self, interpolated_dict, LAMBDA=self.lambda_)
+        gp = calc_gradient_penalty(self, self.detach_and_variable(inference_state_dict), self.lambda_, [5,4,3,2,1])
+        gp = gp + calc_gradient_penalty(self, self.detach_and_variable(generator_state_dict), self.lambda_, [1,2,3,4,5])
 
         return gp
 
@@ -580,7 +598,7 @@ def stdDev(x):
 
 
 
-def calc_gradient_penalty(netD, interpolated_dict, LAMBDA=.1):
+def calc_gradient_penalty(netD, interpolated_dict, LAMBDA, weights):
     """A general utility function modified from a WGAN-GP implementation.
 
     Not pretty rn; TODO make prettier"""
@@ -595,7 +613,7 @@ def calc_gradient_penalty(netD, interpolated_dict, LAMBDA=.1):
                                   grad_outputs=torch.ones(disc_interpolates.size()).to(d),
                                   create_graph=True, retain_graph=True, only_inputs=True)
 
-    gradient_norms = [(g.view(bs, -1).norm(2, dim=1) - 1) ** 2 for g in gradients]
+    gradient_norms = [w*(g.view(bs, -1).norm(2, dim=1) - 1) ** 2 for w,g in zip(weights,gradients)]
 
     gradient_penalty = sum(gradient_norms).mean() * LAMBDA
 

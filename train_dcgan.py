@@ -19,7 +19,7 @@ import argparse
 import os
 import random
 import warnings
-
+from orion.client import report_results
 from classify_from_model import decode_classes_from_layers
 
 parser = argparse.ArgumentParser(description='PyTorch Adversarial Wake-Sleep Training on MNIST')
@@ -115,9 +115,12 @@ parser.add_argument('--historical-averaging',  default=0, type=float,
 parser.add_argument('--minibatch-std-dev', action='store_true',
                     help='Evaluate the standard deviation of the features in the 2nd-to-last layer of the discriminator'
                     ' and add it as a feature. As in progressiveGAN.')
-
+parser.add_argument('--update-ratio',  default=1, type=int,
+                    help='How many times to update the discriminator for every cortex update')
 parser.add_argument('--divisive-normalization', action='store_true',
                     help='Divisive normalization over channels, pixel by pixel. As in ProgressiveGANs')
+parser.add_argument('--spectral-norm', action='store_true',
+                    help='Apply spectral norm to the discriminator')
 parser.add_argument('--soft-div-norm', default=0, type=float,
                     help='A "soft" divisive normalization over channels, pixel by pixel. A differentiable penalty.' 
                    ' If greater than zero, this is the strength by which the penalty is applied. Default 0.')
@@ -222,7 +225,7 @@ def train(args, cortex, train_loader, discriminator,
             # train with gradient penalty
             disc_loss += discriminator.get_gradient_penalty(
                 cortex.inference.intermediate_state_dict,
-                cortex.generator.intermediate_state_dict)
+                cortex.generator.intermediate_state_dict,)
         else:
             d_inf = discriminator(cortex.inference.intermediate_state_dict, detach=True)
             d_gen = discriminator(cortex.generator.intermediate_state_dict, detach=True)
@@ -258,15 +261,17 @@ def train(args, cortex, train_loader, discriminator,
                                      args.gradient_clipping, "inf")
 
         optimizerD.step()
-        # this comes after because running backward will put gradients into the leaves of D that we don't want to follow
-        gen_loss.backward()
-        # Clip gradients?
-        if args.gradient_clipping > 0:
-            # do them together to not mess with the ratio of learning rates
-            nn.utils.clip_grad_norm_(cortex.parameters(),
-                                     args.gradient_clipping, "inf")
-        optimizerG.step()
-        optimizerF.step()
+
+        if batch % args.update_ratio == 0:
+            # this comes after because running backward will put gradients into the leaves of D that we don't want to follow
+            gen_loss.backward()
+            # Clip gradients?
+            if args.gradient_clipping > 0:
+                # do them together to not mess with the ratio of learning rates
+                nn.utils.clip_grad_norm_(cortex.parameters(),
+                                         args.gradient_clipping, "inf")
+            optimizerG.step()
+            optimizerF.step()
 
 
 def main(args):
@@ -399,7 +404,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 eval_std_dev = args.minibatch_std_dev,
                 log_channel_norms = args.detailed_logging or (args.soft_div_norm>0),
                 detailed_logging = args.detailed_logging,
-                lambda_=args.lamda)
+                lambda_=args.lamda,
+                spectral_norm = args.spectral_norm)
 
     # get to proper GPU
     if args.distributed:
@@ -437,21 +443,26 @@ def main_worker(gpu, ngpus_per_node, args):
 
 
     # ------ Build optimizer ------ #
-    if isinstance(cortex, torch.nn.parallel.DistributedDataParallel):
-        generator_params = cortex.module.generator.parameters()
-        inference_params = cortex.module.inference.parameters()
-        discriminator_params = discriminator.parameters()
-    else:
-        generator_params = cortex.generator.parameters()
-        inference_params = cortex.inference.parameters()
-        discriminator_params = discriminator.parameters()
+    # if isinstance(cortex, torch.nn.parallel.DistributedDataParallel):
+    #     generator_params = cortex.module.generator.parameters()
+    #     inference_params = cortex.module.inference.parameters()
+    #     discriminator_params = discriminator.parameters()
+    # else:
+    #     generator_params = cortex.generator.parameters()
+    #     inference_params = cortex.inference.parameters()
+    #     discriminator_params = discriminator.parameters()
 
-    optimizerD = optim.Adam(discriminator_params, lr=args.lr_d, betas=(args.beta1, 0.999), weight_decay = args.wd,
+    optimizerD = optim.Adam(discriminator.parameters(), lr=args.lr_d, betas=(args.beta1, 0.999), weight_decay = args.wd,
                                                                                            amsgrad = args.amsgrad)
-    optimizerG = optim.Adam(generator_params,     lr=args.lr_g, betas=(args.beta1, 0.999), weight_decay = args.wd,
-                                                                                            amsgrad = args.amsgrad)
-    optimizerF = optim.Adam(inference_params,     lr=args.lr_e, betas=(args.beta1, 0.999), weight_decay = args.wd,
-                                                                                            amsgrad = args.amsgrad)
+    # we want the lr to be slower for upper layers as they get more gradient flow
+    optimizerG = optim.Adam([{'params':mod.parameters(),'lr': args.lr_g * (5-i)}
+                                    for i,mod in enumerate(cortex.generator.listed_modules)],
+                     lr=args.lr_g, betas=(args.beta1, 0.999), weight_decay = args.wd,amsgrad = args.amsgrad)
+
+    # similarly for the encoder lower layers show have slower lrs                                                                                            amsgrad = args.amsgrad)
+    optimizerF = optim.Adam([{'params':mod.parameters(),'lr': args.lr_e * (i+1)}
+                                    for i,mod in enumerate(cortex.inference.listed_modules)],
+                     lr=args.lr_e, betas=(args.beta1, 0.999), weight_decay = args.wd,amsgrad = args.amsgrad)
 
     # ------ optionally resume from a checkpoint ------- #
     if args.resume:
@@ -517,7 +528,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                                               args.dataset,
                                                               nonlinear = False,
                                                               lr = 1,
-                                                              folds = 8,
+                                                              folds = 2,
                                                               epochs = 20,
                                                               hidden_size = 1000,
                                                               wd = 1e-3,
@@ -548,7 +559,7 @@ def main_worker(gpu, ngpus_per_node, args):
             }, 'checkpoint.pth.tar')
 
     # For orion. Don't include lowest layer
-    best_accuracy = torch.max(accuracies.mean(dim=0)[1:]).item()
+    best_accuracy = torch.max(accuracies.mean(dim=0)[2:]).item()
     error_rate = 100 - best_accuracy
     report_results([dict(
         name='test_error_rate',
