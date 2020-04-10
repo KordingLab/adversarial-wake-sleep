@@ -21,3 +21,39 @@ def get_gradient_stats(net):
         maximum = max(maximum, p.grad.data.max())
 
     return  maximum
+
+
+def get_gradient_penalty(discriminator, cortex, lamda, i_or_g):
+    """Calculate the gradient of the discriminator's output w/r/t all activations in the state dict,
+    passing them through the encoder to get there obviously,
+    and return the distance of those gradients from 1.
+
+    Gradients are accumulated into D but also the layers of E higher than the layer in question"""
+
+    if i_or_g == 'inference':
+        state_dict = cortex.inference.intermediate_state_dict
+    elif i_or_g == 'generation':
+        state_dict = cortex.generator.intermediate_state_dict
+    else:
+        raise AssertionError("Flag should be either inference or generation")
+
+    gp = 0
+    for i, (layer, activations) in enumerate(state_dict.items()):
+
+        x = activations.detach()
+        # pass through the remaining layers. if i==5 nothing is done here
+        for F in cortex.inference.listed_modules[i:]:
+            x = F(x)
+
+        d = discriminator(x)
+        bs = d.size(0)
+
+        gradients = grad(outputs=d, inputs=x,
+                         grad_outputs=torch.ones(d.size()).to(cortex[0].device),
+                         create_graph=True, retain_graph=True, only_inputs=True)[0]
+
+        gradients = gradients.view(bs, -1)
+
+        gp = gp + ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+
+    return gp * lamda
