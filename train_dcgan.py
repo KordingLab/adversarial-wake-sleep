@@ -131,6 +131,11 @@ parser.add_argument('--kl-from-sn', action='store_true',
 parser.add_argument('--spectral-norm', action='store_true',
                     help="Spectral norm on E and D")
 
+parser.add_argument('--only-latents', action='store_true',
+                    help="When activated, it's only the inputs and top layer we care about. No middle. Should "
+                         "be the same as previously published algorithms; i.e. should work lol")
+
+
 
 def train(args, cortex, train_loader, discriminator,
               optimizerD, optimizerG, optimizerE, epoch):
@@ -140,6 +145,7 @@ def train(args, cortex, train_loader, discriminator,
     cortex.train()
     discriminator.train()
 
+    mse = nn.MSELoss()
     for batch, (images, _) in enumerate(train_loader):
         cortex.log_weight_alignment()
 
@@ -182,21 +188,31 @@ def train(args, cortex, train_loader, discriminator,
         wake_E_loss = alpha * discriminator(inferred_z)
         wake_E_loss.backward()
         optimizerD.zero_grad()
+
+        if args.only_latents:
+            reconstruction_loss = .1*mse(cortex.generator(inferred_z), real_samples)
+            reconstruction_loss.backward()
+            optimizerG.step()
+            optimizerG.zero_grad()
+
         # stabilize E and D with GP
-        gp= get_gradient_penalty(discriminator, cortex, args.lamda, 'inference')
+        gp= get_gradient_penalty(discriminator, cortex, args.lamda, 'inference', only_input=args.only_latents)
         gp.backward()
         optimizerE.step()
+        optimizerE.zero_grad()
 
         if not args.kl_from_sn:
             wake_D_loss =  - alpha * discriminator(inferred_z.detach())
             wake_D_loss.backward()
             optimizerD.step()
+            optimizerD.zero_grad()
 
-        ############### SLEEP ##################
+        ############### SLEEP #################
 
         # fantasize
+        noise = torch.empty(real_samples.size(0),args.noise_dim).normal_().to(real_samples.device)
+        fake_inputs = cortex.generator(noise)
 
-        cortex.noise_and_generate(noise_layer)
 
         # learn to divisive normalize both feedforward and feedback?
         if args.soft_div_norm > 0:
@@ -210,32 +226,56 @@ def train(args, cortex, train_loader, discriminator,
             if batch % 100 == 0:
                 print("Epoch {} Batch {} Overall surprisal {:.2f}".format(epoch, batch, ML_loss.item()))
 
-        # for each layer of the network, pass back up through the discriminator
-        # TODO implement this loop with .cat and .sum
-        inferred_zs = cortex.pass_state_back_up()
-        D = 0
-        for z in inferred_zs:
-            D = D - discriminator(z)
-        D = alpha * D
+        if args.only_latents:
+            inferred_z_fake = cortex.inference(fake_inputs)
+            reconstruction_loss = .1 * mse(inferred_z_fake, noise)
 
-        # stabilize E and D with GP
-        D += get_gradient_penalty(discriminator, cortex, args.lamda, 'generation')
+            # get D
+            D = - alpha * discriminator(inferred_z_fake)
+            ### E and D maximize, G minimizes
 
-        ##  G works to minimize, D and E work to maximize. We do this through zero_grads.
-        # First E and D
-        D.backward()
-        optimizerE.step()
-        optimizerD.step()
-        optimizerG.zero_grad()
+            # stabilize E and D with GP
+            D += get_gradient_penalty(discriminator, cortex, args.lamda, 'generation', only_input=True)
+            D += reconstruction_loss
+            # First E and D
+            D.backward()
+            optimizerE.step()
+            optimizerD.step()
+            optimizerG.zero_grad()
 
-        # Now G
-        D = 0
-        for z in inferred_zs:
-            D = D + discriminator(z)
-        D = alpha * D
+            # Now G
+            D = alpha * discriminator(inferred_z_fake) + reconstruction_loss
 
-        D.backward()
-        optimizerG.step()
+            D.backward()
+            optimizerG.step()
+
+        else:
+            # for each layer of the network, pass back up through the discriminator
+            # TODO implement this loop with .cat and .sum
+            inferred_zs = cortex.pass_state_back_up()
+            D = 0
+            for z in inferred_zs:
+                D = D - discriminator(z)
+            D = alpha * D
+
+            # stabilize E and D with GP
+            D += get_gradient_penalty(discriminator, cortex, args.lamda, 'generation')
+
+            ##  G works to minimize, D and E work to maximize. We do this through zero_grads.
+            # First E and D
+            D.backward()
+            optimizerE.step()
+            optimizerD.step()
+            optimizerG.zero_grad()
+
+            # Now G
+            D = 0
+            for z in inferred_zs:
+                D = D + discriminator(z)
+            D = alpha * D
+
+            D.backward()
+            optimizerG.step()
 
 
 
@@ -274,7 +314,8 @@ def main(args):
 
 def main_worker(gpu, ngpus_per_node, args):
 
-
+    if args.only_latents:
+        assert not args.minimize_inference_surprisal and not args.minimize_generator_surprisal
 
     # Remember that to use multiprocessing, the module we're calling it on must only be ever be called via forward.'
     # No calling its internal methods
