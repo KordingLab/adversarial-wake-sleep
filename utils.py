@@ -1,6 +1,8 @@
 from matplotlib import pyplot as plt
 from numpy import prod
 from math import sqrt
+import torch
+from torch.autograd import Variable, grad
 
 def sv_img(img, savename, epoch = None, title=None,):
     npimg = img[[2,1,0]].permute(1,2,0).numpy()
@@ -42,7 +44,7 @@ def get_gradient_penalty(discriminator, cortex, lamda, i_or_g, only_input =False
         if only_input and i>0:
             continue
 
-        x = activations.detach()
+        x = Variable(activations.detach(), requires_grad = True)
         # pass through the remaining layers. if i==5 nothing is done here
         for F in cortex.inference.listed_modules[i:]:
             x = F(x)
@@ -51,7 +53,7 @@ def get_gradient_penalty(discriminator, cortex, lamda, i_or_g, only_input =False
         bs = d.size(0)
 
         gradients = grad(outputs=d, inputs=x,
-                         grad_outputs=torch.ones(d.size()).to(cortex[0].device),
+                         grad_outputs=torch.ones(d.size()).to(activations.device),
                          create_graph=True, retain_graph=True, only_inputs=True)[0]
 
         gradients = gradients.view(bs, -1)

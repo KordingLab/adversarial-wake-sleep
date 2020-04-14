@@ -12,7 +12,7 @@ import torch.distributed as dist
 
 
 
-from dcgan_models import DeterministicHelmholtz, Discriminator, HistoricalAverageDiscriminatorLoss
+from dcgan_models import DeterministicHelmholtz, Discriminator
 from utils import sv_img, get_gradient_penalty
 
 import argparse
@@ -146,21 +146,13 @@ def train(args, cortex, train_loader, discriminator,
     discriminator.train()
 
     mse = nn.MSELoss()
+    l1 = nn.L1Loss()
     for batch, (images, _) in enumerate(train_loader):
         cortex.log_weight_alignment()
-
         batch_size = images.size()[0]
 
         optimizerG.zero_grad()
         optimizerE.zero_grad()
-
-        if args.label_smoothing:
-            #with prob .1 we switch the labels
-            p = torch.ones(batch_size,1) * .9
-            alpha = torch.bernoulli(p) * 2 - 1
-        else:
-            alpha = torch.ones(batch_size,1)
-        alpha = alpha.to(cortex.device)
 
         ############### WAKE #################
         # get some data
@@ -170,13 +162,21 @@ def train(args, cortex, train_loader, discriminator,
             images = images.cuda()
         real_samples = Variable(images)
 
+        if args.label_smoothing:
+            #with prob .1 we switch the labels
+            p = torch.ones(batch_size,1) * .9
+            alpha = torch.bernoulli(p) * 2 - 1
+        else:
+            alpha = torch.ones(batch_size,1)
+        alpha = alpha.to(real_samples.device)
+
         # pass through inference
         inferred_z = cortex.inference(real_samples)
 
         # now update generator to reduce its surprisal given the inferred state
         # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
         # with Gaussian we have log p  = MSE between actual and predicted
-        ML_loss = 0
+        ML_loss = torch.zeros(1)
         if args.minimize_generator_surprisal or args.detailed_logging or args.soft_div_norm>0:
             ML_loss = cortex.generator_surprisal()
         if args.minimize_generator_surprisal:
@@ -184,16 +184,19 @@ def train(args, cortex, train_loader, discriminator,
             optimizerG.step()
             optimizerG.zero_grad()
 
+        ## argmin_E argmax_D D(E(real_samples))
         # E works to minimize, but D works to maximize, the output of D
-        wake_E_loss = alpha * discriminator(inferred_z)
-        wake_E_loss.backward()
+        wake_E_loss = (alpha * discriminator(inferred_z)).mean() * 0
+        wake_E_loss.backward(retain_graph = True)
         optimizerD.zero_grad()
 
         if args.only_latents:
-            reconstruction_loss = .1*mse(cortex.generator(inferred_z), real_samples)
-            reconstruction_loss.backward()
+            reconstruction_loss = 10*l1(cortex.generator(inferred_z), real_samples)
+            reconstruction_loss.backward(retain_graph = True)
             optimizerG.step()
             optimizerG.zero_grad()
+            if batch % 100 == 0:
+                print("WAKE. Reconst. {:.2f}, disc wake {:.2f}".format(reconstruction_loss.item(), wake_E_loss.item()))
 
         # stabilize E and D with GP
         gp= get_gradient_penalty(discriminator, cortex, args.lamda, 'inference', only_input=args.only_latents)
@@ -202,7 +205,7 @@ def train(args, cortex, train_loader, discriminator,
         optimizerE.zero_grad()
 
         if not args.kl_from_sn:
-            wake_D_loss =  - alpha * discriminator(inferred_z.detach())
+            wake_D_loss =  - (alpha * discriminator(inferred_z.detach())).mean()
             wake_D_loss.backward()
             optimizerD.step()
             optimizerD.zero_grad()
@@ -210,7 +213,7 @@ def train(args, cortex, train_loader, discriminator,
         ############### SLEEP #################
 
         # fantasize
-        noise = torch.empty(real_samples.size(0),args.noise_dim).normal_().to(real_samples.device)
+        noise = torch.empty(real_samples.size(0),args.noise_dim,1,1).normal_().to(real_samples.device)
         fake_inputs = cortex.generator(noise)
 
 
@@ -226,25 +229,29 @@ def train(args, cortex, train_loader, discriminator,
             if batch % 100 == 0:
                 print("Epoch {} Batch {} Overall surprisal {:.2f}".format(epoch, batch, ML_loss.item()))
 
+
         if args.only_latents:
             inferred_z_fake = cortex.inference(fake_inputs)
-            reconstruction_loss = .1 * mse(inferred_z_fake, noise)
+            reconstruction_loss = 1000 * mse(inferred_z_fake, noise)
 
+            ## argmax_G argmin_D,E  D(E(fake_samples))
+            # E, D works to minimize, but G works to maximize, the output of D
             # get D
-            D = - alpha * discriminator(inferred_z_fake)
-            ### E and D maximize, G minimizes
+            D = (alpha * discriminator(inferred_z_fake)).mean() * 0
+            if batch % 100 == 0:
+                print("SLEEP. Reconst. {:.2f}, disc sleep {:.2f}".format(reconstruction_loss.item(), D.item()))
 
             # stabilize E and D with GP
             D += get_gradient_penalty(discriminator, cortex, args.lamda, 'generation', only_input=True)
             D += reconstruction_loss
             # First E and D
-            D.backward()
+            D.backward(retain_graph = True)
             optimizerE.step()
             optimizerD.step()
             optimizerG.zero_grad()
 
             # Now G
-            D = alpha * discriminator(inferred_z_fake) + reconstruction_loss
+            D = - (alpha * discriminator(inferred_z_fake)).mean() + reconstruction_loss
 
             D.backward()
             optimizerG.step()
@@ -392,7 +399,6 @@ def main_worker(gpu, ngpus_per_node, args):
     bp_thru_gen = (not args.no_backprop_through_full_cortex)
 
     bn = False if args.loss_type == 'wasserstein' else True
-    avg_after_n_layers = False if args.avg_after_n_layers<2 else args.avg_after_n_layers
 
 
     cortex = DeterministicHelmholtz(args.noise_dim, args.n_filters, nc,
@@ -404,7 +410,6 @@ def main_worker(gpu, ngpus_per_node, args):
                                     noise_type = args.noise_type,
                                     batchnorm = bn,
                                     normalize = args.divisive_normalization,
-                                    he_init=args.he_initialization,
                                     spectral_norm = args.spectral_norm)
 
     discriminator = Discriminator(args.noise_dim,
@@ -496,6 +501,30 @@ def main_worker(gpu, ngpus_per_node, args):
 
     decoding_error_history = []
 
+    if args.detailed_logging:
+        # how well can we decode from layers?
+        accuracies = decode_classes_from_layers(args.gpu,
+                                                cortex,
+                                                image_size,
+                                                args.n_filters,
+                                                args.noise_dim,
+                                                args.data,
+                                                args.dataset,
+                                                nonlinear=False,
+                                                lr=1,
+                                                folds=3,
+                                                epochs=20,
+                                                hidden_size=1000,
+                                                wd=1e-3,
+                                                opt='sgd',
+                                                lr_schedule=True,
+                                                verbose=False,
+                                                batch_size=args.batch_size,
+                                                workers=args.workers)
+        for i in range(6):
+            print("Layer{}: Accuracy {} +/- {}".format(i, accuracies.mean(dim=0)[i], accuracies.std(dim=0)[i]))
+        decoding_error_history.append(accuracies.mean(dim=0).detach().cpu())
+
     for epoch in range(args.start_epoch, args.epochs):
 
         if args.distributed:
@@ -503,7 +532,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
         train(args, cortex, train_loader, discriminator,
               optimizerD, optimizerG, optimizerF, epoch)
-
 
         if args.save_imgs:
             try:
@@ -529,7 +557,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                                               args.dataset,
                                                               nonlinear = False,
                                                               lr = 1,
-                                                              folds = 8,
+                                                              folds = 3,
                                                               epochs = 20,
                                                               hidden_size = 1000,
                                                               wd = 1e-3,

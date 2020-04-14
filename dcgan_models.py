@@ -262,13 +262,8 @@ class DeterministicHelmholtz(nn.Module):
                                    batchnorm=batchnorm, normalize=normalize, he_init = he_init)
 
         # init
-        if he_init:
-            self.inference.apply(weights_init_he)
-            self.generator.apply(weights_init_he)
-        else:
-            self.inference.apply(weights_init)
-            self.generator.apply(weights_init)
-
+        self.generator.apply(weights_init)
+        self.spectral_norm = spectral_norm
         self.mse = nn.MSELoss()
         self.surprisal_sigma = surprisal_sigma
 
@@ -463,6 +458,9 @@ class DeterministicHelmholtz(nn.Module):
             for i, (G, F) in enumerate(zip(self.generator.listed_modules, self.inference.listed_modules)):
                 gen_weight = list(G.parameters())[0]
                 inf_weight = list(F.parameters())[0]
+                if self.spectral_norm:
+                    # spectral norm changes the order... in the future could do F.modules()[0].weight or weight_orig
+                    inf_weight = list(F.parameters())[1]
 
                 cosine = torch.nn.CosineSimilarity()(inf_weight.transpose(1, 0).cpu().view(1, -1),
                                                      gen_weight.cpu().view(1, -1))
@@ -501,12 +499,12 @@ def KLfromSN(x):
     """
     sig = torch.var(x, 0)
     mu2 = torch.mean(x, 0)**2
-    log_sig = torch.log(sig)
+    log_sig = torch.log(sig + 1e-12)
     mu2_m1 = mu2 - 1
 
     out = .5 * torch.sum(sig + mu2_m1 - log_sig)
 
-    return out
+    return out[None].expand(x.size(0),1)
 
 class Discriminator(nn.Module):
     """A linear readout of the last layer (i.e. the 'noise' layer)
@@ -542,6 +540,7 @@ class Discriminator(nn.Module):
         self.intermediate_Ds = []
 
     def forward(self, z):
+        z = z.squeeze()
         if self.KL_from_sn:
             out = KLfromSN(z)
         else:
