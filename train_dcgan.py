@@ -123,7 +123,8 @@ parser.add_argument('--gradient-clipping', default=0, type=float,
                     help="CLip gradients on everything at this value")
 parser.add_argument('--amsgrad', action='store_true',
                     help="Use AMSgrad?")
-
+parser.add_argument('--update-ratio', default=1, type=float,
+                    help="Ratio of discriminator updates to the others.")
 
 parser.add_argument('--kl-from-sn', action='store_true',
                     help="Instead of an actual (linear) discriminator, calculate the true KL divergence from "
@@ -144,6 +145,7 @@ def train(args, cortex, train_loader, discriminator,
 
     cortex.train()
     discriminator.train()
+    print("Reconstructions, E discriminates too, and KL/wass of wake from prior")
 
     mse = nn.MSELoss()
     l1 = nn.L1Loss()
@@ -153,6 +155,7 @@ def train(args, cortex, train_loader, discriminator,
 
         optimizerG.zero_grad()
         optimizerE.zero_grad()
+        optimizerD.zero_grad()
 
         ############### WAKE #################
         # get some data
@@ -184,38 +187,43 @@ def train(args, cortex, train_loader, discriminator,
             optimizerG.step()
             optimizerG.zero_grad()
 
-        ## argmin_E argmax_D D(E(real_samples))
-        # E works to minimize, but D works to maximize, the output of D
-        wake_E_loss = (alpha * discriminator(inferred_z)).mean() * 0
-        wake_E_loss.backward(retain_graph = True)
-        optimizerD.zero_grad()
+        ## argmax_D_E D(E(real_samples))
+        # recall the discriminator outputs (ideally) >0 for through encoder and <0 for generative posterior
+        # so here E wants to minimize
+        # Also when D is the straight divergence of the prior (i.e. args.kl_from_sn ==True)
+        # E wants to minimize
 
-        if args.only_latents:
+        if batch % args.update_ratio == 0:
+            wake_E_loss = (alpha * discriminator(inferred_z)).mean()
+            wake_E_loss.backward(retain_graph = True)
+            optimizerD.zero_grad()
+
+
             reconstruction_loss = 10*l1(cortex.generator(inferred_z), real_samples)
             reconstruction_loss.backward(retain_graph = True)
-            optimizerG.step()
+            # optimizerG.step()
             optimizerG.zero_grad()
             if batch % 100 == 0:
-                print("WAKE. Reconst. {:.2f}, disc wake {:.2f}".format(reconstruction_loss.item(), wake_E_loss.item()))
+                print("WAKE. Reconst. {:.2f}. closeness to prior {:.2f}".format(reconstruction_loss.item(),
+                                                                                wake_E_loss.item()))
+            optimizerE.step()
+            optimizerE.zero_grad()
 
-        # stabilize E and D with GP
-        gp= get_gradient_penalty(discriminator, cortex, args.lamda, 'inference', only_input=args.only_latents)
-        gp.backward()
-        optimizerE.step()
-        optimizerE.zero_grad()
 
         if not args.kl_from_sn:
-            wake_D_loss =  - (alpha * discriminator(inferred_z.detach())).mean()
+            # stabilize only D with GP
+            gp = get_gradient_penalty(discriminator, cortex, args.lamda, 'inference', only_output=True)
+            wake_D_loss =  - (alpha * discriminator(inferred_z.detach())).mean() + gp
             wake_D_loss.backward()
             optimizerD.step()
             optimizerD.zero_grad()
+            optimizerE.zero_grad()
 
         ############### SLEEP #################
 
         # fantasize
         noise = torch.empty(real_samples.size(0),args.noise_dim,1,1).normal_().to(real_samples.device)
         fake_inputs = cortex.generator(noise)
-
 
         # learn to divisive normalize both feedforward and feedback?
         if args.soft_div_norm > 0:
@@ -225,36 +233,60 @@ def train(args, cortex, train_loader, discriminator,
         if args.minimize_inference_surprisal:
             ML_loss = cortex.inference_surprisal()
             ML_loss.backward()
-        if not args.quiet:
-            if batch % 100 == 0:
-                print("Epoch {} Batch {} Overall surprisal {:.2f}".format(epoch, batch, ML_loss.item()))
+        # if not args.quiet:
+        #     if batch % 100 == 0:
+        #         print("Epoch {} Batch {} Overall surprisal {:.2f}".format(epoch, batch, ML_loss.item()))
 
 
         if args.only_latents:
-            inferred_z_fake = cortex.inference(fake_inputs)
-            reconstruction_loss = 1000 * mse(inferred_z_fake, noise)
+
+            # train discriminator to recognize noise as noise
+            if not args.kl_from_sn:
+                sleep_D_loss = (alpha * discriminator(noise)).mean()
+                sleep_D_loss += get_gradient_penalty(discriminator, cortex, args.lamda, 'generation', only_output=True)
+
+                sleep_D_loss.backward()
+                optimizerD.step()
+                optimizerD.zero_grad()
+
 
             ## argmax_G argmin_D,E  D(E(fake_samples))
-            # E, D works to minimize, but G works to maximize, the output of D
-            # get D
-            D = (alpha * discriminator(inferred_z_fake)).mean() * 0
-            if batch % 100 == 0:
-                print("SLEEP. Reconst. {:.2f}, disc sleep {:.2f}".format(reconstruction_loss.item(), D.item()))
+            # recall the discriminator outputs (ideally) >0 for through encoder and <0 for generative posterior
+            # so here G wants to minimize D(E(G(z))) but E maximize
+            # Also when D is the straight divergence of the prior (i.e. args.kl_from_sn ==True)
+            # G wants to minimize while E wants to maximize
+            if batch % args.update_ratio == 0:
+                inferred_z_fake = cortex.inference(fake_inputs)
+                reconstruction_loss = 10 * mse(inferred_z_fake, noise)
 
-            # stabilize E and D with GP
-            D += get_gradient_penalty(discriminator, cortex, args.lamda, 'generation', only_input=True)
-            D += reconstruction_loss
-            # First E and D
-            D.backward(retain_graph = True)
-            optimizerE.step()
-            optimizerD.step()
-            optimizerG.zero_grad()
+                # E, D works to minimize, but G works to maximize, the output of D
+                sleep_D_loss_recon = .1 * (alpha * discriminator(inferred_z_fake)).mean()
 
-            # Now G
-            D = - (alpha * discriminator(inferred_z_fake)).mean() + reconstruction_loss
+                # First the generator
+                G_loss = reconstruction_loss + sleep_D_loss_recon
+                G_loss.backward(retain_graph = True)
+                optimizerG.step()
+                optimizerG.zero_grad()
+                optimizerD.zero_grad()
+                optimizerE.zero_grad()
 
-            D.backward()
-            optimizerG.step()
+
+                # then the discriminator
+                E_D_loss = - sleep_D_loss_recon
+                E_D_loss.backward(retain_graph = True)
+                optimizerE.step()
+                if not args.kl_from_sn:
+                    gp = get_gradient_penalty(discriminator, cortex, args.lamda, 'inference',
+                                                         only_output=True)
+
+                    gp.backward()
+                    optimizerD.step()
+                    optimizerD.zero_grad()
+
+                if batch % 100 == 0:
+                    print("SLEEP.  reconst. {:.2f} closeness to prior of recont. {:.2f}".format(reconstruction_loss.item()
+                                                                                                ,sleep_D_loss_recon.item()))
+
 
         else:
             # for each layer of the network, pass back up through the discriminator

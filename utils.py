@@ -25,7 +25,7 @@ def get_gradient_stats(net):
     return  maximum
 
 
-def get_gradient_penalty(discriminator, cortex, lamda, i_or_g, only_input =False):
+def get_gradient_penalty(discriminator, cortex, lamda, i_or_g, only_input =False, only_output = False):
     """Calculate the gradient of the discriminator's output w/r/t all activations in the state dict,
     passing them through the encoder to get there obviously,
     and return the distance of those gradients from 1.
@@ -41,7 +41,9 @@ def get_gradient_penalty(discriminator, cortex, lamda, i_or_g, only_input =False
 
     gp = 0
     for i, (layer, activations) in enumerate(state_dict.items()):
-        if only_input and i>0:
+        if only_output and i<5:
+            continue
+        elif only_input and i>0:
             continue
 
         x = Variable(activations.detach(), requires_grad = True)

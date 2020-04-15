@@ -526,14 +526,19 @@ class Discriminator(nn.Module):
             self.eval_std_dev = eval_std_dev
 
             if spectral_norm:
-                self.linear = nn.utils.spectral_norm(nn.Linear(noise_dim + plus1, 1))
+                self.linear = nn.utils.spectral_norm(nn.Linear(noise_dim + plus1, 100))
+
             else:
-                self.linear = nn.Linear(noise_dim + plus1, 1)
+                self.linear = nn.Linear(noise_dim + plus1, 100)
+
+            self.sparse_mask = nn.Parameter(torch.empty(noise_dim + plus1,
+                                                        noise_dim + plus1).bernoulli_(.5), requires_grad = False)
 
             self.apply(weights_init)
         else:
             # still have >0 registered params even though there's nothing to optimize
             self.linear = nn.Linear(1, 1)
+
 
         # logging
         self.detailed_logging = detailed_logging
@@ -547,7 +552,7 @@ class Discriminator(nn.Module):
             if self.eval_std_dev:
                 z = stdDev(z)
 
-            out = self.linear(z)
+            out = KLfromSN(z) + self.linear(torch.mm(z,self.sparse_mask)).mean(dim=1)
 
         if self.detailed_logging:
             self.intermediate_Ds.append(out.mean().item())
