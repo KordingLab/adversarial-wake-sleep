@@ -135,6 +135,9 @@ parser.add_argument('--spectral-norm', action='store_true',
 parser.add_argument('--only-latents', action='store_true',
                     help="When activated, it's only the inputs and top layer we care about. No middle. Should "
                          "be the same as previously published algorithms; i.e. should work lol")
+parser.add_argument('--reparam-trick', action='store_true',
+                    help="When activated, uses the VAE loss function on the encoder's outputs. "
+                         "Interprets half the channels as variance of noise to-be-added, etc.")
 
 
 
@@ -198,10 +201,13 @@ def train(args, cortex, train_loader, discriminator,
             wake_E_loss.backward(retain_graph = True)
             optimizerD.zero_grad()
 
-
-            reconstruction_loss = 10*l1(cortex.generator(inferred_z), real_samples)
+            if args.reparam_trick:
+                reconstruction_loss = 10*l1(cortex.generator(add_noise(inferred_z)), real_samples)
+            else:
+                reconstruction_loss = 10*l1(cortex.generator(inferred_z), real_samples)
             reconstruction_loss.backward(retain_graph = True)
-            # optimizerG.step()
+            if args.reparam_trick:
+                optimizerG.step()
             optimizerG.zero_grad()
             if batch % 100 == 0:
                 print("WAKE. Reconst. {:.2f}. closeness to prior {:.2f}".format(reconstruction_loss.item(),
@@ -238,85 +244,82 @@ def train(args, cortex, train_loader, discriminator,
         #         print("Epoch {} Batch {} Overall surprisal {:.2f}".format(epoch, batch, ML_loss.item()))
 
 
-        if args.only_latents:
 
-            # train discriminator to recognize noise as noise
+        # train discriminator to recognize noise as noise
+        if not args.kl_from_sn:
+            sleep_D_loss = (alpha * discriminator(noise)).mean()
+            sleep_D_loss += get_gradient_penalty(discriminator, cortex, args.lamda, 'generation', only_output=True)
+
+            sleep_D_loss.backward()
+            optimizerD.step()
+            optimizerD.zero_grad()
+
+
+        ## argmax_G argmin_D,E  D(E(fake_samples))
+        # recall the discriminator outputs (ideally) >0 for through encoder and <0 for generative posterior
+        # so here G wants to minimize D(E(G(z))) but E maximize
+        # Also when D is the straight divergence of the prior (i.e. args.kl_from_sn ==True)
+        # G wants to minimize while E wants to maximize
+        if batch % args.update_ratio == 0:
+            if not args.only_latents:
+                inferred_zs = cortex.pass_state_back_up()
+                inferred_z_fake = inferred_zs[0]
+
+                D = 0
+                for z in inferred_zs:
+                    D = D + discriminator(z)
+                D = alpha * D
+
+            else:
+                inferred_z_fake = cortex.inference(fake_inputs)
+
+                D = alpha * discriminator(inferred_z_fake)
+
+            if args.reparam_trick:
+                reconstruction_loss = torch.zeros(1).cuda(args.gpu)
+            else:
+                reconstruction_loss = 10 * mse(inferred_z_fake, noise)
+
+            # E, D works to minimize, but G works to maximize, the output of D
+            sleep_D_loss_recon = 0.1 * D.mean()
+
+            # First the generator
+            G_loss = reconstruction_loss + sleep_D_loss_recon
+            G_loss.backward(retain_graph = True)
+            optimizerG.step()
+            optimizerG.zero_grad()
+            optimizerD.zero_grad()
+            optimizerE.zero_grad()
+
+
+            # then the discriminator
+            E_D_loss = - sleep_D_loss_recon
+            E_D_loss.backward(retain_graph = True)
+            optimizerE.step()
             if not args.kl_from_sn:
-                sleep_D_loss = (alpha * discriminator(noise)).mean()
-                sleep_D_loss += get_gradient_penalty(discriminator, cortex, args.lamda, 'generation', only_output=True)
+                gp = get_gradient_penalty(discriminator, cortex, args.lamda, 'inference',
+                                                     only_output=True)
 
-                sleep_D_loss.backward()
+                gp.backward()
                 optimizerD.step()
                 optimizerD.zero_grad()
 
-
-            ## argmax_G argmin_D,E  D(E(fake_samples))
-            # recall the discriminator outputs (ideally) >0 for through encoder and <0 for generative posterior
-            # so here G wants to minimize D(E(G(z))) but E maximize
-            # Also when D is the straight divergence of the prior (i.e. args.kl_from_sn ==True)
-            # G wants to minimize while E wants to maximize
-            if batch % args.update_ratio == 0:
-                inferred_z_fake = cortex.inference(fake_inputs)
-                reconstruction_loss = 10 * mse(inferred_z_fake, noise)
-
-                # E, D works to minimize, but G works to maximize, the output of D
-                sleep_D_loss_recon = .1 * (alpha * discriminator(inferred_z_fake)).mean()
-
-                # First the generator
-                G_loss = reconstruction_loss + sleep_D_loss_recon
-                G_loss.backward(retain_graph = True)
-                optimizerG.step()
-                optimizerG.zero_grad()
-                optimizerD.zero_grad()
-                optimizerE.zero_grad()
-
-
-                # then the discriminator
-                E_D_loss = - sleep_D_loss_recon
-                E_D_loss.backward(retain_graph = True)
-                optimizerE.step()
-                if not args.kl_from_sn:
-                    gp = get_gradient_penalty(discriminator, cortex, args.lamda, 'inference',
-                                                         only_output=True)
-
-                    gp.backward()
-                    optimizerD.step()
-                    optimizerD.zero_grad()
-
-                if batch % 100 == 0:
-                    print("SLEEP.  reconst. {:.2f} closeness to prior of recont. {:.2f}".format(reconstruction_loss.item()
+            if batch % 100 == 0:
+                print("SLEEP.  reconst. {:.2f} closeness to prior of recont. {:.2f}".format(reconstruction_loss.item()
                                                                                                 ,sleep_D_loss_recon.item()))
 
 
-        else:
-            # for each layer of the network, pass back up through the discriminator
-            # TODO implement this loop with .cat and .sum
-            inferred_zs = cortex.pass_state_back_up()
-            D = 0
-            for z in inferred_zs:
-                D = D - discriminator(z)
-            D = alpha * D
+def add_noise(x):
+    "Assumes the second half of x is variances"
+    n_channels = x.size()[1]
+    assert n_channels % 2 == 0
 
-            # stabilize E and D with GP
-            D += get_gradient_penalty(discriminator, cortex, args.lamda, 'generation')
+    mu = x[:, :n_channels // 2, :, :]
+    sigma = x[:, n_channels // 2:, :, :]
 
-            ##  G works to minimize, D and E work to maximize. We do this through zero_grads.
-            # First E and D
-            D.backward()
-            optimizerE.step()
-            optimizerD.step()
-            optimizerG.zero_grad()
-
-            # Now G
-            D = 0
-            for z in inferred_zs:
-                D = D + discriminator(z)
-            D = alpha * D
-
-            D.backward()
-            optimizerG.step()
-
-
+    noise = torch.empty_like(mu).normal_()
+    out = mu + noise * sigma
+    return out
 
 def main(args):
     if args.seed is not None:
@@ -442,13 +445,15 @@ def main_worker(gpu, ngpus_per_node, args):
                                     noise_type = args.noise_type,
                                     batchnorm = bn,
                                     normalize = args.divisive_normalization,
-                                    spectral_norm = args.spectral_norm)
+                                    spectral_norm = args.spectral_norm,
+                                    reparam_trick = args.reparam_trick)
 
     discriminator = Discriminator(args.noise_dim,
                                  eval_std_dev=args.minibatch_std_dev,
                                  spectral_norm = args.spectral_norm,
                                  detailed_logging = args.detailed_logging or (args.soft_div_norm>0),
-                                 KL_from_sn = args.kl_from_sn)
+                                 KL_from_sn = args.kl_from_sn,
+                                 reparam_trick = args.reparam_trick)
 
     # get to proper GPU
     if args.distributed:
@@ -533,13 +538,16 @@ def main_worker(gpu, ngpus_per_node, args):
 
     decoding_error_history = []
 
+    t2 = 2 if args.reparam_trick else 1
+
+
     if args.detailed_logging:
         # how well can we decode from layers?
         accuracies = decode_classes_from_layers(args.gpu,
                                                 cortex,
                                                 image_size,
                                                 args.n_filters,
-                                                args.noise_dim,
+                                                args.noise_dim *t2,
                                                 args.data,
                                                 args.dataset,
                                                 nonlinear=False,
@@ -570,7 +578,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 os.mkdir("gen_images")
             except:
                 pass
-            to_visualize = cortex.noise_and_generate()[:100].detach().cpu()
+            noise = torch.empty(100, args.noise_dim, 1, 1).normal_().cuda(args.gpu)
+            to_visualize = cortex.generator(noise).detach().cpu()
             grid = utils.make_grid(to_visualize,
                                   nrow=10, padding=5, normalize=True,
                                   range=None, scale_each=False, pad_value=0)
@@ -584,7 +593,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                                               cortex,
                                                               image_size,
                                                               args.n_filters,
-                                                              args.noise_dim,
+                                                              args.noise_dim * t2,
                                                               args.data,
                                                               args.dataset,
                                                               nonlinear = False,

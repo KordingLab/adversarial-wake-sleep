@@ -134,7 +134,8 @@ class Generator(nn.Module):
 
 class Inference(nn.Module):
     def __init__(self, noise_dim, n_filters, n_img_channels, noise_type = 'none', backprop_to_start = True,
-                 image_size = 64, batchnorm = False, normalize = False, he_init = False, spectral_norm = False):
+                 image_size = 64, batchnorm = False, normalize = False, he_init = False, spectral_norm = False,
+                 reparam_trick = False):
         super(Inference, self).__init__()
         self.noise_dim = noise_dim
         self.n_filters = n_filters
@@ -144,6 +145,8 @@ class Inference(nn.Module):
         # In the learned_filter mode, all conv layers need to output twice the number of channels as before.
         maybetimestwo = 2 if noise_type=="learned_filter" else 1
 
+        if reparam_trick:
+            noise_dim = noise_dim * 2
 
         self.inference_4to5_conv = nn.Sequential(
             nn.utils.spectral_norm(nn.Conv2d(n_filters * 8, noise_dim * maybetimestwo, image_size // 16, 1, 0 ))
@@ -251,13 +254,17 @@ class DeterministicHelmholtz(nn.Module):
                  batchnorm = False,
                  normalize=False,
                  he_init = False,
-                 spectral_norm = False):
+                 spectral_norm = False,
+                 reparam_trick = False):
         super(DeterministicHelmholtz, self).__init__()
 
         assert image_size % 16 == 0
 
+        assert not (reparam_trick and noise_type != 'none')
+
         self.inference = Inference(noise_dim, n_filters, n_img_channels, noise_type, backprop_to_start_inf, image_size,
-                           batchnorm=batchnorm, normalize=normalize, he_init = he_init, spectral_norm = spectral_norm)
+                           batchnorm=batchnorm, normalize=normalize, he_init = he_init, spectral_norm = spectral_norm,
+                                    reparam_trick = reparam_trick)
         self.generator = Generator(noise_dim, n_filters, n_img_channels, noise_type, backprop_to_start_gen, image_size,
                                    batchnorm=batchnorm, normalize=normalize, he_init = he_init)
 
@@ -506,6 +513,19 @@ def KLfromSN(x):
 
     return out[None].expand(x.size(0),1)
 
+def KLfromSN_VAE(x):
+    """Here the inputs are means the first half of channels, then variances
+    """
+    n_channels = x.size()[1]
+    assert n_channels % 2 == 0
+
+    mu = x[:, :n_channels // 2]
+    sigma = x[:, n_channels // 2:]
+
+    out = .5 * torch.sum(mu**2 + sigma**2 - torch.log(sigma**2) -1)
+
+    return out[None].expand(x.size(0),1)
+
 class Discriminator(nn.Module):
     """A linear readout of the last layer (i.e. the 'noise' layer)
 
@@ -517,10 +537,12 @@ class Discriminator(nn.Module):
                  eval_std_dev=False,
                  spectral_norm = False,
                  detailed_logging = False,
-                 KL_from_sn = False):
+                 KL_from_sn = False,
+                 reparam_trick = False):
         super(Discriminator, self).__init__()
 
         self.KL_from_sn = KL_from_sn
+        self.reparam_trick = reparam_trick
         if not KL_from_sn:
             plus1 = 1 if eval_std_dev else 0
             self.eval_std_dev = eval_std_dev
@@ -547,7 +569,10 @@ class Discriminator(nn.Module):
     def forward(self, z):
         z = z.squeeze()
         if self.KL_from_sn:
-            out = KLfromSN(z)
+            if self.reparam_trick:
+                out = KLfromSN_VAE(z)
+            else:
+                out = KLfromSN(z)
         else:
             if self.eval_std_dev:
                 z = stdDev(z)
