@@ -123,7 +123,7 @@ parser.add_argument('--gradient-clipping', default=0, type=float,
                     help="CLip gradients on everything at this value")
 parser.add_argument('--amsgrad', action='store_true',
                     help="Use AMSgrad?")
-parser.add_argument('--update-ratio', default=1, type=float,
+parser.add_argument('--update-ratio', default=1, type=int,
                     help="Ratio of discriminator updates to the others.")
 
 parser.add_argument('--kl-from-sn', action='store_true',
@@ -138,6 +138,12 @@ parser.add_argument('--only-latents', action='store_true',
 parser.add_argument('--reparam-trick', action='store_true',
                     help="When activated, uses the VAE loss function on the encoder's outputs. "
                          "Interprets half the channels as variance of noise to-be-added, etc.")
+parser.add_argument('--strength-on-D', default=.1, type=float,
+                    help="Relative to the reconstruction, how much to penalize the output of the encoder "
+                         "to be close to standard normal")
+parser.add_argument('--buffer-of-generater', action='store_true',
+                    help="If the update ratio is >1, store the generated images and use these to update the encoder "
+                         "too when its turn comes around.")
 
 
 
@@ -233,8 +239,12 @@ def train(args, cortex, train_loader, discriminator,
 
         # learn to divisive normalize both feedforward and feedback?
         if args.soft_div_norm > 0:
-            div_norm_loss = cortex.get_pixelwise_channel_norms() * args.soft_div_norm
+            div_norm_loss = cortex.get_pixelwise_channel_norms(just_generator=True) * args.soft_div_norm
             div_norm_loss.backward(retain_graph = True)
+            # optimizerE.step()
+            # optimizerE.zero_grad()
+            optimizerG.step()
+            optimizerG.zero_grad()
 
         if args.minimize_inference_surprisal:
             ML_loss = cortex.inference_surprisal()
@@ -260,37 +270,37 @@ def train(args, cortex, train_loader, discriminator,
         # so here G wants to minimize D(E(G(z))) but E maximize
         # Also when D is the straight divergence of the prior (i.e. args.kl_from_sn ==True)
         # G wants to minimize while E wants to maximize
+        if not args.only_latents:
+            inferred_zs = cortex.pass_state_back_up()
+
+            D = 0
+            reconstruction_loss = 0
+            for z in inferred_zs:
+                D = D + discriminator(z)
+                reconstruction_loss = 100 * mse(z, noise) + reconstruction_loss
+
+            D = alpha * D
+
+        else:
+            inferred_z_fake = cortex.inference(fake_inputs)
+
+            D = alpha * discriminator(inferred_z_fake)
+            reconstruction_loss = 1000 * mse(inferred_z_fake, noise)
+
+        # E, D works to minimize, but G works to maximize, the output of D
+        sleep_D_loss_recon = args.strength_on_D * D.mean()
+        if epoch==0:
+            sleep_D_loss_recon *= 10
+
+        # First the generator
+        G_loss = reconstruction_loss + sleep_D_loss_recon
+        G_loss.backward(retain_graph = True)
+        optimizerG.step()
+        optimizerG.zero_grad()
+        optimizerD.zero_grad()
+        optimizerE.zero_grad()
+
         if batch % args.update_ratio == 0:
-            if not args.only_latents:
-                inferred_zs = cortex.pass_state_back_up()
-                inferred_z_fake = inferred_zs[0]
-
-                D = 0
-                for z in inferred_zs:
-                    D = D + discriminator(z)
-                D = alpha * D
-
-            else:
-                inferred_z_fake = cortex.inference(fake_inputs)
-
-                D = alpha * discriminator(inferred_z_fake)
-
-            if args.reparam_trick:
-                reconstruction_loss = torch.zeros(1).cuda(args.gpu)
-            else:
-                reconstruction_loss = 10 * mse(inferred_z_fake, noise)
-
-            # E, D works to minimize, but G works to maximize, the output of D
-            sleep_D_loss_recon = 0.1 * D.mean()
-
-            # First the generator
-            G_loss = reconstruction_loss + sleep_D_loss_recon
-            G_loss.backward(retain_graph = True)
-            optimizerG.step()
-            optimizerG.zero_grad()
-            optimizerD.zero_grad()
-            optimizerE.zero_grad()
-
 
             # then the discriminator
             E_D_loss = - sleep_D_loss_recon
@@ -500,11 +510,11 @@ def main_worker(gpu, ngpus_per_node, args):
         inference_params = cortex.inference.parameters()
         discriminator_params = discriminator.parameters()
 
-    optimizerD = optim.Adam(discriminator_params, lr=args.lr_d, betas=(args.beta1, 0.999), weight_decay = args.wd,
+    optimizerD = optim.Adam(discriminator_params, lr=args.lr_d, betas=(args.beta1, 0.99), weight_decay = args.wd,
                                                                                            amsgrad = args.amsgrad)
-    optimizerG = optim.Adam(generator_params,     lr=args.lr_g, betas=(args.beta1, 0.999), weight_decay = args.wd,
+    optimizerG = optim.Adam(generator_params,     lr=args.lr_g, betas=(args.beta1, 0.99), weight_decay = args.wd,
                                                                                             amsgrad = args.amsgrad)
-    optimizerF = optim.Adam(inference_params,     lr=args.lr_e, betas=(args.beta1, 0.999), weight_decay = args.wd,
+    optimizerF = optim.Adam(inference_params,     lr=args.lr_e, betas=(args.beta1, 0.99), weight_decay = args.wd,
                                                                                             amsgrad = args.amsgrad)
 
     # ------ optionally resume from a checkpoint ------- #

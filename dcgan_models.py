@@ -381,16 +381,16 @@ class DeterministicHelmholtz(nn.Module):
 
         return ML_loss
 
-    def get_pixelwise_channel_norms(self):
+    def get_pixelwise_channel_norms(self, just_generator = False):
         """This can be used to implement a 'soft' divisive normalization (where the 'hard' version is
         that which is implemented in Karras et al.). It can also be used for logging & debugging.
 
         Logs the total value by layer as a tuple (inferred norm, generated norm)
 
         Returns the pixel-wise distance from 0 (as a cost) to be minimized)"""
-
-        if self.inference.intermediate_state_dict['Input'] is None:
-            raise AssertionError("Inference must be run first before calculating this.")
+        if not just_generator:
+            if self.inference.intermediate_state_dict['Input'] is None:
+                raise AssertionError("Inference must be run first before calculating this.")
         if self.generator.intermediate_state_dict['Input'] is None:
             raise AssertionError("Inference must be run first before calculating this.")
 
@@ -399,15 +399,21 @@ class DeterministicHelmholtz(nn.Module):
         total_distance_from_1 = 0
 
         for i, layer in enumerate(self.layer_names):
+            if layer == 'Layer5':
+                # Redundant/fighting the overall loss
+                continue
 
-            inferred_state = self.inference.intermediate_state_dict[layer]
+            if not just_generator:
+                inferred_state = self.inference.intermediate_state_dict[layer]
+                inferred_state_pixel_norm = (((inferred_state ** 2).mean(dim=1) + epsilon).sqrt())
+                inferred_state_pixel_norm_dist_from_1 = self.mse(inferred_state_pixel_norm,
+                                                                 torch.ones_like(inferred_state_pixel_norm))
+                total_distance_from_1 = inferred_state_pixel_norm_dist_from_1 + total_distance_from_1
+            else:
+                total_distance_from_1 = 0
+                inferred_state_pixel_norm = torch.zeros(0)
+
             generated_state = self.generator.intermediate_state_dict[layer]
-
-            inferred_state_pixel_norm = (((inferred_state**2).mean(dim=1) + epsilon).sqrt())
-            inferred_state_pixel_norm_dist_from_1 = self.mse(inferred_state_pixel_norm,
-                                                             torch.ones_like(inferred_state_pixel_norm))
-            total_distance_from_1 = inferred_state_pixel_norm_dist_from_1 + total_distance_from_1
-
             generated_state_pixel_norm = (((generated_state**2).mean(dim=1) + epsilon).sqrt())
             generated_state_pixel_norm_dist_from_1 = self.mse(generated_state_pixel_norm,
                                                              torch.ones_like(generated_state_pixel_norm))
