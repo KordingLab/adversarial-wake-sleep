@@ -4,7 +4,8 @@ from collections import OrderedDict
 from torch.distributions import Laplace, Normal
 from torch.autograd import Variable, grad
 import math
-from numpy import prod
+from numpy import prod, sum
+from torch import sparse
 
 class Generator(nn.Module):
     """ The feedback edges of the cortex. Generates images with the DCGAN architecture.
@@ -30,7 +31,7 @@ class Generator(nn.Module):
     
     """
     def __init__(self, noise_dim, n_filters, n_img_channels, noise_type = 'none', backprop_to_start = True,
-                 image_size = 64, batchnorm = False, normalize = False, he_init = False):
+                 image_size = 64, batchnorm = False, normalize = False, he_init = False, dropout = False):
         super(Generator, self).__init__()
         self.noise_dim = noise_dim
         self.n_filters = n_filters
@@ -52,7 +53,8 @@ class Generator(nn.Module):
             AddNoise(noise_type, n_filters * 8),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
             nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            NormalizationLayer() if normalize else null(),
+            nn.Dropout() if dropout else null())
 
         self.generative_4to3_conv = nn.Sequential(
             # state size. (n_filters*8) x 4 x 4
@@ -61,7 +63,8 @@ class Generator(nn.Module):
             AddNoise(noise_type, n_filters * 4),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
             nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            NormalizationLayer() if normalize else null(),
+            nn.Dropout() if dropout else null())
 
         self.generative_3to2_conv = nn.Sequential(
             # state size. (n_filters*4) x 8 x 8
@@ -70,7 +73,8 @@ class Generator(nn.Module):
             AddNoise(noise_type, n_filters * 2),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
             nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            NormalizationLayer() if normalize else null(),
+            nn.Dropout() if dropout else null())
 
         self.generative_2to1_conv = nn.Sequential(
             # state size. (n_filters*2) x 16 x 16
@@ -79,7 +83,8 @@ class Generator(nn.Module):
             AddNoise(noise_type, n_filters),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
             nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            NormalizationLayer() if normalize else null(),
+            nn.Dropout() if dropout else null())
             # state size. (n_filters) x 32 x 32
 
         self.generative_1to0_conv = nn.Sequential(
@@ -135,7 +140,7 @@ class Generator(nn.Module):
 class Inference(nn.Module):
     def __init__(self, noise_dim, n_filters, n_img_channels, noise_type = 'none', backprop_to_start = True,
                  image_size = 64, batchnorm = False, normalize = False, he_init = False, spectral_norm = False,
-                 reparam_trick = False):
+                 reparam_trick = False, dropout = False):
         super(Inference, self).__init__()
         self.noise_dim = noise_dim
         self.n_filters = n_filters
@@ -164,7 +169,8 @@ class Inference(nn.Module):
             AddNoise(noise_type, n_filters * 8),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
             nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            NormalizationLayer() if normalize else null(),
+            nn.Dropout() if dropout else null())
 
         self.inference_2to3_conv = nn.Sequential(
             nn.utils.spectral_norm(nn.Conv2d(n_filters * 2, n_filters * 4 * maybetimestwo, 4, 2, 1 ))
@@ -174,7 +180,8 @@ class Inference(nn.Module):
             AddNoise(noise_type, n_filters * 4),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
             nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            NormalizationLayer() if normalize else null(),
+            nn.Dropout() if dropout else null())
 
         self.inference_1to2_conv = nn.Sequential(
             nn.utils.spectral_norm(nn.Conv2d(n_filters, n_filters * 2 * maybetimestwo, 4, 2, 1 ))
@@ -184,7 +191,8 @@ class Inference(nn.Module):
             AddNoise(noise_type, n_filters * 2),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
             nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            NormalizationLayer() if normalize else null(),
+            nn.Dropout() if dropout else null())
 
         self.inference_0to1_conv = nn.Sequential(
             nn.utils.spectral_norm(nn.Conv2d(n_img_channels, n_filters * maybetimestwo, 4, 2, 1 ))
@@ -194,7 +202,8 @@ class Inference(nn.Module):
             AddNoise(noise_type, n_filters),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
             nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            NormalizationLayer() if normalize else null(),
+            nn.Dropout() if dropout else null())
 
 
         # list modules bottom to top. Probably a more general way exists
@@ -217,11 +226,15 @@ class Inference(nn.Module):
                          for k, v in self.intermediate_state_dict.items()}
         return detached_dict
 
-    def forward(self, x):
-        self.intermediate_state_dict['Input'] = x
+    def forward(self, x, from_layer = 0):
+        if from_layer == 0:
+            self.intermediate_state_dict['Input'] = x
         # iterate through layers and pass the input upwards
-        for F, layer_name in zip(self.listed_modules,
-                                 self.layer_names[1:]):
+        for i, (F, layer_name) in enumerate(zip(self.listed_modules,
+                                                self.layer_names[1:])):
+            if i < from_layer:
+                continue
+
             # this setting makes all gradient flow only go one layer back
             if not self.backprop_to_start:
                 x = x.detach()
@@ -255,7 +268,8 @@ class DeterministicHelmholtz(nn.Module):
                  normalize=False,
                  he_init = False,
                  spectral_norm = False,
-                 reparam_trick = False):
+                 reparam_trick = False,
+                 dropout = False):
         super(DeterministicHelmholtz, self).__init__()
 
         assert image_size % 16 == 0
@@ -264,9 +278,9 @@ class DeterministicHelmholtz(nn.Module):
 
         self.inference = Inference(noise_dim, n_filters, n_img_channels, noise_type, backprop_to_start_inf, image_size,
                            batchnorm=batchnorm, normalize=normalize, he_init = he_init, spectral_norm = spectral_norm,
-                                    reparam_trick = reparam_trick)
+                                    reparam_trick = reparam_trick, dropout = dropout)
         self.generator = Generator(noise_dim, n_filters, n_img_channels, noise_type, backprop_to_start_gen, image_size,
-                                   batchnorm=batchnorm, normalize=normalize, he_init = he_init)
+                                   batchnorm=batchnorm, normalize=normalize, he_init = he_init, dropout = dropout)
 
         # init
         self.generator.apply(weights_init)
@@ -509,6 +523,8 @@ def stdDev(x):
 
 def KLfromSN(x):
     """Assumes the inputs are batched samples from a Gaussian dist. Calculates the KL of this dist. from a mean=0, var=1 dist.
+
+
     """
     sig = torch.var(x, 0)
     mu2 = torch.mean(x, 0)**2
@@ -518,6 +534,17 @@ def KLfromSN(x):
     out = .5 * torch.sum(sig + mu2_m1 - log_sig)
 
     return out[None].expand(x.size(0),1)
+
+def moments_from_prior(x):
+    """
+    Matches the first few moments of the batch empirical distribution to an exponential with scale = 1
+
+    """
+    loss = 0
+    for i in range(1,4):
+        loss  = loss + torch.mean(x**i,0)/math.factorial(i)
+
+    return loss[None].expand(x.size(0),1)
 
 def KLfromSN_VAE(x):
     """Here the inputs are means the first half of channels, then variances
@@ -533,57 +560,60 @@ def KLfromSN_VAE(x):
     return out[None].expand(x.size(0),1)
 
 class Discriminator(nn.Module):
-    """A linear readout of the last layer (i.e. the 'noise' layer)
+    """A linear readout of all layers, but through a sparse mapping to a population whose output is averaged
 
     OR
 
     The KL divergence of the inputs from a standard normal distribution if KL_from_sn is True"""
 
-    def __init__(self, noise_dim,
-                 eval_std_dev=False,
-                 spectral_norm = False,
+    def __init__(self, image_size,
+                 n_filters,
+                 noise_dim,
+                 n_input_channels,
                  detailed_logging = False,
-                 KL_from_sn = False,
-                 reparam_trick = False):
+                 population_size = 1000,
+                 avg_connections_per_neuron = 200
+                 ):
         super(Discriminator, self).__init__()
 
-        self.KL_from_sn = KL_from_sn
-        self.reparam_trick = reparam_trick
-        if not KL_from_sn:
-            plus1 = 1 if eval_std_dev else 0
-            self.eval_std_dev = eval_std_dev
+        dimensionalities = [image_size**2 * n_input_channels] + \
+                           [(image_size//(i+2))**2 * n_filters*(2**i) for i in range(4)] + \
+                           [noise_dim]
+        self.dimensionalities = dimensionalities
 
-            if spectral_norm:
-                self.linear = nn.utils.spectral_norm(nn.Linear(noise_dim + plus1, 100))
 
-            else:
-                self.linear = nn.Linear(noise_dim + plus1, 100)
+        # build a sparse masking matrix for each layer of the cortex
+        self.sparse_weights = []
+        for d in dimensionalities:
+            n_connections_in_this_layer = float(d)/sum(dimensionalities) * avg_connections_per_neuron
 
-            self.sparse_mask = nn.Parameter(torch.empty(noise_dim + plus1,
-                                                        noise_dim + plus1).bernoulli_(.5), requires_grad = False)
+            # a 2xN list of nonzero entries
+            i = torch.stack([torch.empty_(n_connections_in_this_layer).random_(0, population_size),
+                             torch.empty_(n_connections_in_this_layer).random_(0, d)])
+            i = torch.empty_(2,n_connections_in_this_layer).random_(0,d)
 
-            self.apply(weights_init)
-        else:
-            # still have >0 registered params even though there's nothing to optimize
-            self.linear = nn.Linear(1, 1)
+            # initialize the parameters
+            v = torch.empty(n_connections_in_this_layer).normal(0, 2 / float(avg_connections_per_neuron))
 
+            s = torch.Size([population_size, d])
+            self.sparse_weights.append(nn.Parameter(sparse.FloatTensor(i,v,s), requires_grad = True))
+
+        self.relu = nn.LeakyReLU(.2, inplace = True)
+        self.biases = nn.Parameter(torch.zeros(population_size))
+        self.linear = nn.Linear(population_size,1)
 
         # logging
         self.detailed_logging = detailed_logging
         self.intermediate_Ds = []
 
-    def forward(self, z):
-        z = z.squeeze()
-        if self.KL_from_sn:
-            if self.reparam_trick:
-                out = KLfromSN_VAE(z)
-            else:
-                out = KLfromSN(z)
-        else:
-            if self.eval_std_dev:
-                z = stdDev(z)
+    def forward(self, intermediate_state_dict):
+        out = 0
+        for i, (layer, activations) in enumerate(intermediate_state_dict.items()):
+            z = activations.view(-1, self.dimensionalities[i])
 
-            out = KLfromSN(z) + self.linear(torch.mm(z,self.sparse_mask)).mean(dim=1)
+            out = out + sparse.mm(self.sparse_weights[i], z.t()).t()
+        out = self.relu(out + self.biases)
+        out = self.linear(out)
 
         if self.detailed_logging:
             self.intermediate_Ds.append(out.mean().item())
@@ -625,7 +655,7 @@ class AddNoise(nn.Module):
     outputs of the layer. In this case this module results in outputs that are not of the same shape
     as the inputs but rather of half the number of channel dimensions.
 
-    For alo other modes, the output is of the same shape as the inputs.
+    For all other modes, the output is of the same shape as the inputs.
 
     """
 
@@ -639,8 +669,8 @@ class AddNoise(nn.Module):
             self.log_sigma = nn.Parameter(torch.ones(1) * -2)
         elif self.noise_type == 'learned_by_channel':
             self.log_sigma = nn.Parameter(torch.ones(n_channels) * -2)
-        elif self.noise_type == 'poisson':
-            self.relu = nn.ReLU()
+        elif self.noise_type == 'poisson' or self.noise_type == 'exponential':
+            self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
 
@@ -674,6 +704,11 @@ class AddNoise(nn.Module):
             elif self.noise_type == 'poisson':
                 noise = torch.empty_like(x).normal_()
                 out = x + noise * self.relu(x) / 10
+            elif self.noise_type == 'exponential':
+                # nice one-liner
+                noise = torch.empty_like(x).uniform_(0,1).reciprocal_().log_()
+                noise = self.relu(noise - 1)
+                out = x + noise
             else:
                 raise AssertionError("noise_type not in "
                                      "['none', 'fixed', 'learned_by_layer', 'learned_by_channel', "
