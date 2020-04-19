@@ -59,14 +59,14 @@ def moments_from_prior(x):
     """
     loss = 0
     for i in range(1, 4):
-        loss = loss + torch.mean(x ** i, 0) / math.factorial(i)
+        loss = loss + (torch.mean(x ** i, 0) / math.factorial(i) - 1).norm()
 
     return loss
 
 def to_variable(intermediate_state_dict):
     v_state_dict = OrderedDict()
     for i, (layer, activations) in enumerate(intermediate_state_dict.items()):
-        v_state_dict[layer] = Variable(activations.detach())
+        v_state_dict[layer] = Variable(activations.detach(), requires_grad = True)
     return v_state_dict
 
 

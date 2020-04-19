@@ -572,35 +572,29 @@ class Discriminator(nn.Module):
                  n_input_channels,
                  detailed_logging = False,
                  population_size = 1000,
-                 avg_connections_per_neuron = 200
+                 avg_connections_per_neuron = 500
                  ):
         super(Discriminator, self).__init__()
 
         dimensionalities = [image_size**2 * n_input_channels] + \
-                           [(image_size//(i+2))**2 * n_filters*(2**i) for i in range(4)] + \
+                           [(image_size//(2**(i+1)))**2 * n_filters*(2**i) for i in range(4)] + \
                            [noise_dim]
         self.dimensionalities = dimensionalities
 
-
         # build a sparse masking matrix for each layer of the cortex
-        self.sparse_weights = []
+        # ugh the sparse support is buggy... so this is just actually a dense mask
+        self.sparse_masks = nn.ParameterList()
+        self.first_linears = nn.ModuleList()
         for d in dimensionalities:
-            n_connections_in_this_layer = float(d)/sum(dimensionalities) * avg_connections_per_neuron
+            mask = torch.empty(population_size,d).bernoulli_(float(avg_connections_per_neuron)/sum(dimensionalities))
+            mask = nn.Parameter(mask,requires_grad = False)
+            mod = nn.Linear(d,population_size)
 
-            # a 2xN list of nonzero entries
-            i = torch.stack([torch.empty_(n_connections_in_this_layer).random_(0, population_size),
-                             torch.empty_(n_connections_in_this_layer).random_(0, d)])
-            i = torch.empty_(2,n_connections_in_this_layer).random_(0,d)
-
-            # initialize the parameters
-            v = torch.empty(n_connections_in_this_layer).normal(0, 2 / float(avg_connections_per_neuron))
-
-            s = torch.Size([population_size, d])
-            self.sparse_weights.append(nn.Parameter(sparse.FloatTensor(i,v,s), requires_grad = True))
+            self.sparse_masks.append(mask)
+            self.first_linears.append(mod)
 
         self.relu = nn.LeakyReLU(.2, inplace = True)
-        self.biases = nn.Parameter(torch.zeros(population_size))
-        self.linear = nn.Linear(population_size,1)
+        self.linear = nn.utils.spectral_norm(nn.Linear(population_size,1))
 
         # logging
         self.detailed_logging = detailed_logging
@@ -610,9 +604,11 @@ class Discriminator(nn.Module):
         out = 0
         for i, (layer, activations) in enumerate(intermediate_state_dict.items()):
             z = activations.view(-1, self.dimensionalities[i])
+            # reset the weights under the mask
+            self.first_linears[i].weight.data = self.sparse_masks[i] * self.first_linears[i].weight.data
+            out = out + self.first_linears[i](z)
 
-            out = out + sparse.mm(self.sparse_weights[i], z.t()).t()
-        out = self.relu(out + self.biases)
+        out = self.relu(out)
         out = self.linear(out)
 
         if self.detailed_logging:

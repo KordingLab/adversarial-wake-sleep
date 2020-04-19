@@ -154,9 +154,6 @@ parser.add_argument('--align-combinations', action='store_true',
                          "generator through those activations that have not been passed through the encoder first.")
 # TODO implement these ^^
 
-parser.add_argument('--strength-on-D', default=.1, type=float,
-                    help="Relative to the reconstruction, how much to penalize the output of the encoder "
-                         "to be close to standard normal")
 parser.add_argument('--regularize-towards-prior', default=0, type=float,
                     help=" Make the encoder and decoder both have activations that look like the set prior. "
                          "Meant to play well with noise-type = exponential")
@@ -208,6 +205,8 @@ def train(args, cortex, train_loader, discriminator,
         ML_loss = torch.zeros(1)
         if args.minimize_generator_surprisal or args.detailed_logging or args.soft_div_norm>0:
             ML_loss = cortex.generator_surprisal()
+        else:
+            ML_loss = torch.zeros(1)
         if args.minimize_generator_surprisal:
             ML_loss.backward()
             optimizerG.step()
@@ -219,17 +218,19 @@ def train(args, cortex, train_loader, discriminator,
         # Also when D is the straight divergence of the prior (i.e. args.kl_from_sn ==True)
         # E wants to minimize
 
-        if batch % args.update_ratio == 0:
+        if batch % (2*args.update_ratio) == 0:
             wake_E_loss = (alpha * discriminator(cortex.inference.intermediate_state_dict)).mean()
+            prior_dist =  dist_from_prior(cortex.inference.intermediate_state_dict)
             if args.regularize_towards_prior > 0:
-                prior_dist = args.regularize_towards_prior * dist_from_prior(cortex.inference.intermediate_state_dict)
-                wake_E_loss += prior_dist
+                wake_E_loss += args.regularize_towards_prior * prior_dist
+
             wake_E_loss.backward(retain_graph = True)
             optimizerD.zero_grad()
 
             if batch % 100 == 0:
-                print("WAKE. Reconst. {:.2f}. closeness to prior {:.2f}".format(wake_E_loss.item()),
-                                                                                prior_dist.item())
+                print("WAKE. Disc {:.2f} Reconst. {:.2f}. closeness to prior {:.2f}".format(wake_E_loss.item(),
+                                                                                            ML_loss.item(),
+                                                                                prior_dist.item()))
             optimizerE.step()
             optimizerE.zero_grad()
 
@@ -277,8 +278,7 @@ def train(args, cortex, train_loader, discriminator,
                 # the rest of the state seen by the discriminator is the generated state
                 D = 0
                 prior_dist = 0
-                for i in range(5):
-                    layer, activations = cortex.generator.intermediate_state_dict.items()[i]
+                for i, (layer, activations) in enumerate(cortex.generator.intermediate_state_dict.items()):
                     cortex.inference(activations, from_layer = i)
 
                     D = D + discriminator(cortex.inference.intermediate_state_dict)
@@ -291,10 +291,11 @@ def train(args, cortex, train_loader, discriminator,
                                                      cortex.inference.intermediate_state_dict)
 
                 D = alpha * D
+                G_loss = - D.mean()
 
             else:
                 D = alpha * discriminator(cortex.generator.intermediate_state_dict)
-                G_loss = - D
+                G_loss = - D.mean()
                 prior_dist = 0
 
             if args.regularize_towards_prior > 0:
@@ -310,18 +311,19 @@ def train(args, cortex, train_loader, discriminator,
             optimizerE.zero_grad()
 
 
-        if args.encoder_collusion:
-            E_D_loss = D
-            E_D_loss += get_gradient_penalty(discriminator, cortex, args.lamda, 'inference')
-            if args.push_fake_from_prior:
-                E_D_loss -= prior_dist
-            E_D_loss.backward(retain_graph = True)
-            optimizerE.step()
-            optimizerD.step()
+            if args.encoder_collusion:
+                E_D_loss = D.mean()
+                E_D_loss += get_gradient_penalty(discriminator, cortex, args.lamda, 'inference')
+                if args.push_fake_from_prior:
+                    E_D_loss -= prior_dist
+                E_D_loss.backward(retain_graph = True)
+                if batch % (2* args.update_ratio) == 0:
+                    optimizerE.step()
+                optimizerD.step()
 
         if batch % 100 == 0:
-            print("SLEEP.  discriminator loss. {:.2f} closeness to prior of recont. {:.2f}".format(D.item()
-                                                                                                ,prior_dist.item()))
+            print("SLEEP.  discriminator loss. {:.2f} closeness to prior of generator + inf(gen) {:.2f}".format(
+                      D.mean().item(),prior_dist))
 
 
 def add_noise(x):
@@ -461,7 +463,6 @@ def main_worker(gpu, ngpus_per_node, args):
                                     batchnorm = bn,
                                     normalize = args.divisive_normalization,
                                     spectral_norm = args.spectral_norm,
-                                    reparam_trick = args.reparam_trick,
                                     dropout = args.dropout)
 
     discriminator = Discriminator(image_size,
@@ -470,7 +471,7 @@ def main_worker(gpu, ngpus_per_node, args):
                  nc,
                  detailed_logging = args.detailed_logging,
                  population_size = 1000,
-                 avg_connections_per_neuron = 200)
+                 avg_connections_per_neuron = 500)
 
     # get to proper GPU
     if args.distributed:
@@ -555,16 +556,13 @@ def main_worker(gpu, ngpus_per_node, args):
 
     decoding_error_history = []
 
-    t2 = 2 if args.reparam_trick else 1
-
-
     if args.detailed_logging:
         # how well can we decode from layers?
         accuracies = decode_classes_from_layers(args.gpu,
                                                 cortex,
                                                 image_size,
                                                 args.n_filters,
-                                                args.noise_dim *t2,
+                                                args.noise_dim,
                                                 args.data,
                                                 args.dataset,
                                                 nonlinear=False,
@@ -589,6 +587,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         train(args, cortex, train_loader, discriminator,
               optimizerD, optimizerG, optimizerF, epoch)
+        cortex.eval()
 
         if args.save_imgs:
             try:
@@ -610,7 +609,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                                               cortex,
                                                               image_size,
                                                               args.n_filters,
-                                                              args.noise_dim * t2,
+                                                              args.noise_dim,
                                                               args.data,
                                                               args.dataset,
                                                               nonlinear = False,
