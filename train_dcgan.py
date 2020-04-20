@@ -134,6 +134,15 @@ parser.add_argument('--amsgrad', action='store_true',
                     help="Use AMSgrad?")
 parser.add_argument('--spectral-norm', action='store_true',
                     help='Apply spectral norm to the discriminator')
+parser.add_argument('--reconstruction', default=0, type=float,
+                    help='Backprop generative surprisal instead of just doing it one layer. This involves generating '
+                         'down from every layers inferred state, and is thus like reconstructing inputs.')
+parser.add_argument('--reconstruction-also-inference', action='store_true',
+                    help='Also have the inference engine minimize reconstruction.')
+parser.add_argument('--selu', action='store_true',
+                    help='Self-normalizing networks.')
+parser.add_argument('--dropout', action='store_true',
+                    help='Self-normalizing networks.')
 
 
 def train(args, cortex, train_loader, discriminator,
@@ -182,6 +191,10 @@ def train(args, cortex, train_loader, discriminator,
             ML_loss = cortex.generator_surprisal()
         if args.minimize_generator_surprisal:
             ML_loss.backward()
+
+        if args.reconstruction > 0:
+            ML_loss = ML_loss + args.reconstruction * cortex.reconstruct_back_down(
+                                                                also_inference=args.reconstruction_also_inference)
 
         # We could update the discriminator here too, if we want.
         # For efficiency I'm putting it later (in the 'sleep') section
@@ -406,7 +419,9 @@ def main_worker(gpu, ngpus_per_node, args):
                                     noise_type = args.noise_type,
                                     batchnorm = bn,
                                     normalize = args.divisive_normalization,
-                                    he_init=args.he_initialization)
+                                    he_init=args.he_initialization,
+                                    dropout = args.dropout,
+                                    selu = args.selu)
 
     discriminator = Discriminator(image_size, cortex.layer_names,
                                   args.noise_dim, args.n_filters, nc,
@@ -462,7 +477,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                     for i,mod in enumerate(cortex.generator.listed_modules)],
                      lr=args.lr_g, betas=(args.beta1, 0.999), weight_decay = args.wd,amsgrad = args.amsgrad)
 
-    # similarly for the encoder lower layers show have slower lrs
+    # similarly for the encoder lower layers should have have slower lrs
     optimizerF = optim.Adam([{'params':mod.parameters(),'lr': args.lr_e * (i+1)}
                                     for i,mod in enumerate(cortex.inference.listed_modules)],
                      lr=args.lr_e, betas=(args.beta1, 0.999), weight_decay = args.wd,amsgrad = args.amsgrad)
@@ -505,7 +520,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         train(args, cortex, train_loader, discriminator,
               optimizerD, optimizerG, optimizerF, epoch)
-
+        cortex.eval()
 
         if args.save_imgs:
             try:

@@ -30,7 +30,7 @@ class Generator(nn.Module):
     
     """
     def __init__(self, noise_dim, n_filters, n_img_channels, noise_type = 'none', backprop_to_start = True,
-                 image_size = 64, batchnorm = False, normalize = False, he_init = False):
+                 image_size = 64, batchnorm = False, normalize = False, he_init = False, selu = False, dropout= False):
         super(Generator, self).__init__()
         self.noise_dim = noise_dim
         self.n_filters = n_filters
@@ -51,8 +51,9 @@ class Generator(nn.Module):
             MaybeHeRescale(noise_dim, 1,rescale=he_init),
             AddNoise(noise_type, n_filters * 8),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
-            nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            nn.SELU() if selu else nn.ReLU(),
+            NormalizationLayer() if normalize else null(),
+            nn.AlphaDropout(.3) if dropout else null())
 
         self.generative_4to3_conv = nn.Sequential(
             # state size. (n_filters*8) x 4 x 4
@@ -60,8 +61,9 @@ class Generator(nn.Module):
             MaybeHeRescale(n_filters * 8, 2, rescale=he_init),
             AddNoise(noise_type, n_filters * 4),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
-            nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            nn.SELU() if selu else nn.ReLU(),
+            NormalizationLayer() if normalize else null(),
+            nn.AlphaDropout(.3) if dropout else null())
 
         self.generative_3to2_conv = nn.Sequential(
             # state size. (n_filters*4) x 8 x 8
@@ -69,8 +71,9 @@ class Generator(nn.Module):
             MaybeHeRescale(n_filters * 4, 2, rescale=he_init),
             AddNoise(noise_type, n_filters * 2),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
-            nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            nn.SELU() if selu else  nn.ReLU(),
+            NormalizationLayer() if normalize else null(),
+            nn.AlphaDropout(.3) if dropout else null())
 
         self.generative_2to1_conv = nn.Sequential(
             # state size. (n_filters*2) x 16 x 16
@@ -78,8 +81,9 @@ class Generator(nn.Module):
             MaybeHeRescale(n_filters * 2, 2, rescale=he_init),
             AddNoise(noise_type, n_filters),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
-            nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            nn.SELU() if selu else nn.ReLU(),
+            NormalizationLayer() if normalize else null(),
+            nn.AlphaDropout(.3) if dropout else null())
             # state size. (n_filters) x 32 x 32
 
         self.generative_1to0_conv = nn.Sequential(
@@ -112,29 +116,29 @@ class Generator(nn.Module):
                             for k, v in self.intermediate_state_dict.items()}
         return detached_dict
 
-    def forward(self, x, from_layer = 5):
+    def forward(self, x, from_layer = 5, update_states = True):
         # iterate through layers and pass the noise downwards
         for i, (G, layer_name) in enumerate(zip(self.listed_modules[::-1],
                                                 self.layer_names[:0:-1])):
             # Skip the topmost n layers ?
             if len(self.listed_modules) - i > from_layer:
                 continue
-
-            self.intermediate_state_dict[layer_name] = x
+            if update_states:
+                self.intermediate_state_dict[layer_name] = x
 
             # this setting makes all gradient flow only go one layer back
             if not self.backprop_to_start:
                 x = x.detach()
             x = G(x)
-
-        self.intermediate_state_dict["Input"] = x
+        if update_states:
+            self.intermediate_state_dict["Input"] = x
 
         return x
 
 
 class Inference(nn.Module):
     def __init__(self, noise_dim, n_filters, n_img_channels, noise_type = 'none', backprop_to_start = True,
-                 image_size = 64, batchnorm = False, normalize = False, he_init = False):
+                 image_size = 64, batchnorm = False, normalize = False, he_init = False, selu=False, dropout = False):
         super(Inference, self).__init__()
         self.noise_dim = noise_dim
         self.n_filters = n_filters
@@ -156,32 +160,36 @@ class Inference(nn.Module):
             MaybeHeRescale(n_filters * 4, 4, rescale=he_init),
             AddNoise(noise_type, n_filters * 8),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
-            nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            nn.SELU() if selu else nn.ReLU(),
+            NormalizationLayer() if normalize else null(),
+            nn.AlphaDropout(.3) if dropout else null())
 
         self.inference_2to3_conv = nn.Sequential(
             nn.Conv2d(n_filters * 2, n_filters * 4 * maybetimestwo, 4, 2, 1 ),
             MaybeHeRescale(n_filters * 2, 4, rescale=he_init),
             AddNoise(noise_type, n_filters * 4),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
-            nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            nn.SELU() if selu else nn.ReLU(),
+            NormalizationLayer() if normalize else null(),
+            nn.AlphaDropout(.3) if dropout else null())
 
         self.inference_1to2_conv = nn.Sequential(
             nn.Conv2d(n_filters, n_filters * 2 * maybetimestwo, 4, 2, 1 ),
             MaybeHeRescale(n_filters, 4, rescale=he_init),
             AddNoise(noise_type, n_filters * 2),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
-            nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            nn.SELU() if selu else nn.ReLU(),
+            NormalizationLayer() if normalize else null(),
+            nn.AlphaDropout(.3) if dropout else null())
 
         self.inference_0to1_conv = nn.Sequential(
             nn.Conv2d(n_img_channels, n_filters * maybetimestwo, 4, 2, 1 ),
             MaybeHeRescale(n_img_channels, 4, rescale=he_init),
             AddNoise(noise_type, n_filters),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
-            nn.ReLU(),
-            NormalizationLayer() if normalize else null())
+            nn.SELU() if selu else nn.ReLU(),
+            NormalizationLayer() if normalize else null(),
+            nn.AlphaDropout(.3) if dropout else null())
 
 
         # list modules bottom to top. Probably a more general way exists
@@ -240,15 +248,19 @@ class DeterministicHelmholtz(nn.Module):
                  backprop_to_start_gen=True,
                  batchnorm = False,
                  normalize=False,
-                 he_init = False):
+                 he_init = False,
+                 selu = False,
+                 dropout = False):
         super(DeterministicHelmholtz, self).__init__()
 
         assert image_size % 16 == 0
 
         self.inference = Inference(noise_dim, n_filters, n_img_channels, noise_type, backprop_to_start_inf, image_size,
-                                   batchnorm=batchnorm, normalize=normalize, he_init = he_init)
+                                   batchnorm=batchnorm, normalize=normalize, he_init = he_init,
+                                   selu = selu, dropout = dropout)
         self.generator = Generator(noise_dim, n_filters, n_img_channels, noise_type, backprop_to_start_gen, image_size,
-                                   batchnorm=batchnorm, normalize=normalize, he_init = he_init)
+                                   batchnorm=batchnorm, normalize=normalize, he_init = he_init,
+                                   selu = selu, dropout = dropout)
 
         # init
         if he_init:
@@ -435,6 +447,30 @@ class DeterministicHelmholtz(nn.Module):
 
                 error = self.mse(lower_h, reconstruction)
                 self.intermediate_reconstructions[self.layer_names[i]].append(error.item())
+
+    def reconstruct_back_down(self, also_inference = False):
+        """From the current *inferential* distribution, pass the state back down from each layer (through
+        the generative model) down to the inputs. Minimize the error."""
+        if self.inference.intermediate_state_dict['Input'] is None:
+            raise AssertionError("Inference must be run first before calculating this.")
+
+        l1_loss = nn.L1Loss()
+
+        total_loss = 0
+        for i,layer in enumerate(self.layer_names):
+            if layer == 'Input':
+                continue
+
+            activations = self.inference.intermediate_state_dict[layer]
+            if not also_inference:
+                activations = activations.detach()
+
+            gen_img = self.generator(activations,
+                                     from_layer = i, update_states = False)
+
+            total_loss = total_loss + l1_loss(self.inference.intermediate_state_dict['Input'], gen_img)
+
+        return total_loss
 
     def log_weight_alignment(self):
         if self.log_weight_alignment_:
