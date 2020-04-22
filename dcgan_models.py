@@ -138,7 +138,8 @@ class Generator(nn.Module):
 
 class Inference(nn.Module):
     def __init__(self, noise_dim, n_filters, n_img_channels, noise_type = 'none', backprop_to_start = True,
-                 image_size = 64, batchnorm = False, normalize = False, he_init = False, selu=False, dropout = False):
+                 image_size = 64, batchnorm = False, normalize = False, he_init = False, selu=False, dropout = False,
+                 deeper_inference  = False, noise_before = False):
         super(Inference, self).__init__()
         self.noise_dim = noise_dim
         self.n_filters = n_filters
@@ -148,15 +149,20 @@ class Inference(nn.Module):
         # In the learned_filter mode, all conv layers need to output twice the number of channels as before.
         maybetimestwo = 2 if noise_type=="learned_filter" else 1
 
+        maybenoise = 3 if noise_before else 0
+
+        # this would be simple to build programmatically in the future with ModuleList, but explicit for now.
 
         self.inference_4to5_conv = nn.Sequential(
-            nn.Conv2d(n_filters * 8, noise_dim * maybetimestwo, image_size // 16, 1, 0 ),
+            NoiseChannel() if noise_before else null(),
+            nn.Conv2d(n_filters * 8 + maybenoise, noise_dim * maybetimestwo, image_size // 16, 1, 0 ),
             MaybeHeRescale(n_filters * 8, image_size // 16, rescale=he_init),
             AddNoise(noise_type, noise_dim)
         )
 
         self.inference_3to4_conv = nn.Sequential(
-            nn.Conv2d(n_filters * 4, n_filters * 8 * maybetimestwo, 4, 2, 1 ),
+            NoiseChannel() if noise_before else null(),
+            nn.Conv2d(n_filters * 4 + maybenoise, n_filters * 8 * maybetimestwo, 4, 2, 1 ),
             MaybeHeRescale(n_filters * 4, 4, rescale=he_init),
             AddNoise(noise_type, n_filters * 8),
             nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
@@ -165,7 +171,8 @@ class Inference(nn.Module):
             nn.AlphaDropout(.3) if dropout else null())
 
         self.inference_2to3_conv = nn.Sequential(
-            nn.Conv2d(n_filters * 2, n_filters * 4 * maybetimestwo, 4, 2, 1 ),
+            NoiseChannel() if noise_before else null(),
+            nn.Conv2d(n_filters * 2 + maybenoise, n_filters * 4 * maybetimestwo, 4, 2, 1 ),
             MaybeHeRescale(n_filters * 2, 4, rescale=he_init),
             AddNoise(noise_type, n_filters * 4),
             nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
@@ -174,7 +181,8 @@ class Inference(nn.Module):
             nn.AlphaDropout(.3) if dropout else null())
 
         self.inference_1to2_conv = nn.Sequential(
-            nn.Conv2d(n_filters, n_filters * 2 * maybetimestwo, 4, 2, 1 ),
+            NoiseChannel() if noise_before else null(),
+            nn.Conv2d(n_filters + maybenoise, n_filters * 2 * maybetimestwo, 4, 2, 1 ),
             MaybeHeRescale(n_filters, 4, rescale=he_init),
             AddNoise(noise_type, n_filters * 2),
             nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
@@ -183,7 +191,8 @@ class Inference(nn.Module):
             nn.AlphaDropout(.3) if dropout else null())
 
         self.inference_0to1_conv = nn.Sequential(
-            nn.Conv2d(n_img_channels, n_filters * maybetimestwo, 4, 2, 1 ),
+            NoiseChannel() if noise_before else null(),
+            nn.Conv2d(n_img_channels + maybenoise, n_filters * maybetimestwo, 4, 2, 1 ),
             MaybeHeRescale(n_img_channels, 4, rescale=he_init),
             AddNoise(noise_type, n_filters),
             nn.BatchNorm2d(n_filters) if batchnorm else null(),
@@ -250,14 +259,17 @@ class DeterministicHelmholtz(nn.Module):
                  normalize=False,
                  he_init = False,
                  selu = False,
-                 dropout = False):
+                 dropout = False,
+                 deeper_inference = False,
+                 noise_before = False):
         super(DeterministicHelmholtz, self).__init__()
 
         assert image_size % 16 == 0
 
         self.inference = Inference(noise_dim, n_filters, n_img_channels, noise_type, backprop_to_start_inf, image_size,
                                    batchnorm=batchnorm, normalize=normalize, he_init = he_init,
-                                   selu = selu, dropout = dropout)
+                                   selu = selu, dropout = dropout, deeper_inference = deeper_inference,
+                                   noise_before = noise_before)
         self.generator = Generator(noise_dim, n_filters, n_img_channels, noise_type, backprop_to_start_gen, image_size,
                                    batchnorm=batchnorm, normalize=normalize, he_init = he_init,
                                    selu = selu, dropout = dropout)
@@ -276,6 +288,7 @@ class DeterministicHelmholtz(nn.Module):
         self.layer_names = list(self.inference.intermediate_state_dict.keys())
         self.which_layers = range(len(self.layer_names))
         self.noise_dist = Normal(torch.tensor([0.0]), torch.tensor([1.0]))
+        self.noise_before = noise_before
 
         # logging
         self.log_intermediate_surprisals = detailed_logging
@@ -420,7 +433,7 @@ class DeterministicHelmholtz(nn.Module):
         return total_distance_from_1
 
 
-    def log_layerwise_reconstructions(self):
+    def layerwise_reconstructions(self):
         """From the current *inferential* distribution, determine (and record?) the
         error upon reconstruction at each layer (i.e. generating down and inferring back up).
 
@@ -429,24 +442,27 @@ class DeterministicHelmholtz(nn.Module):
         if self.inference.intermediate_state_dict['Input'] is None:
             raise AssertionError("Inference must be run first before calculating this.")
 
-        if self.log_intermediate_reconstructions:
-            for i, (G, F) in enumerate(zip(self.generator.listed_modules, self.inference.listed_modules)):
-                if i not in self.which_layers:
-                    self.intermediate_reconstructions[self.layer_names[i]].append(-1)
-                    continue
+        total_loss = 0
+        for i, (G, F) in enumerate(zip(self.generator.listed_modules, self.inference.listed_modules)):
+            if i not in self.which_layers:
+                self.intermediate_reconstructions[self.layer_names[i]].append(-1)
+                continue
 
-                lower_h = self.inference.intermediate_state_dict[self.layer_names[i]].detach()
+            lower_h = self.inference.intermediate_state_dict[self.layer_names[i]].detach()
 
-                # if lower_h.is_cuda and self.ngpu > 1:
-                #     x = nn.parallel.data_parallel(F, lower_h, range(self.ngpu))
-                #     reconstruction = nn.parallel.data_parallel(G, x, range(self.ngpu))
-                # else:
-                x = F(lower_h)
-                reconstruction = G(x)
+            # if lower_h.is_cuda and self.ngpu > 1:
+            #     x = nn.parallel.data_parallel(F, lower_h, range(self.ngpu))
+            #     reconstruction = nn.parallel.data_parallel(G, x, range(self.ngpu))
+            # else:
+            x = F(lower_h)
+            reconstruction = G(x)
 
 
-                error = self.mse(lower_h, reconstruction)
+            error = self.mse(lower_h, reconstruction)
+            total_loss = total_loss + error
+            if self.log_intermediate_reconstructions:
                 self.intermediate_reconstructions[self.layer_names[i]].append(error.item())
+        return total_loss
 
     def reconstruct_back_down(self, also_inference = False):
         """From the current *inferential* distribution, pass the state back down from each layer (through
@@ -477,6 +493,8 @@ class DeterministicHelmholtz(nn.Module):
             for i, (G, F) in enumerate(zip(self.generator.listed_modules, self.inference.listed_modules)):
                 gen_weight = list(G.parameters())[0]
                 inf_weight = list(F.parameters())[0]
+                if self.noise_before:
+                    inf_weight = inf_weight[:,:-3]
 
                 cosine = torch.nn.CosineSimilarity()(inf_weight.transpose(1, 0).cpu().view(1, -1),
                                                      gen_weight.cpu().view(1, -1))
@@ -970,6 +988,23 @@ def weights_init_he(net):
             m.weight.data.normal_(0, 1)
             if m.bias is not None:
                 m.bias.data.zero_()
+
+class NoiseChannel(nn.Module):
+    """Adds some additional channels that are pure uniform noise"""
+
+    def __init__(self,n_channels = 3):
+        super(NoiseChannel, self).__init__()
+        self.n_channels = n_channels
+
+
+    def forward(self, x):
+        if self.training:
+            noise = torch.empty_like(x)[:,:self.n_channels,:,:].uniform_()
+        else:
+            noise = torch.zeros_like(x)[:, :self.n_channels, :, :]
+        x = torch.cat([x,noise],dim=1)
+        return x
+
 
 class AddNoise(nn.Module):
     """

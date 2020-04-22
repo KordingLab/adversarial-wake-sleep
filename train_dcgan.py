@@ -93,8 +93,8 @@ parser.add_argument('--lamda', default=.1, type=float,
                     help='Lambda for the gradient penalty in the WGAN formulation. Only for Wasserstein loss.')
 
 parser.add_argument('--noise-type', default = 'none',
-                    choices= ['none', 'fixed', 'learned_by_layer', 'learned_by_channel', 'learned_filter', 'poisson'],
-                    help="What variance of Gaussian noise should be applied after all layers in the "
+                    choices= ['none', 'fixed', 'learned_by_layer', 'learned_by_channel', 'learned_filter', 'poisson',],
+                    help="What variance of Gaussian noise should be applied *after* all layers in the "
                             "cortex? See docs for details. Default is no noise; fixed has variance 0.01")
 
 
@@ -142,7 +142,15 @@ parser.add_argument('--reconstruction-also-inference', action='store_true',
 parser.add_argument('--selu', action='store_true',
                     help='Self-normalizing networks.')
 parser.add_argument('--dropout', action='store_true',
-                    help='Self-normalizing networks.')
+                    help='Alpha dropout, as in self-normalizing networks.')
+
+parser.add_argument('--layerwise-reconstruction', default=0, type=float,
+                    help='Minimize reconstruction between each layer')
+# parser.add_argument('--deeper-inference', action='store_true',
+#                     help='Have each inference module be a two-layer NN rather than 1')
+parser.add_argument('--noise-before', action='store_true',
+                    help='Add some noise channels *before* transforming up in inference. This is the reparameterization'
+                         'trick: we want an approximate posterior but dont care if its nonstandard')
 
 
 def train(args, cortex, train_loader, discriminator,
@@ -181,7 +189,6 @@ def train(args, cortex, train_loader, discriminator,
         # pass through inference
         cortex.inference(real_samples)
 
-        cortex.log_layerwise_reconstructions()
 
         # now update generator with the wake-sleep step
         # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
@@ -195,6 +202,9 @@ def train(args, cortex, train_loader, discriminator,
         if args.reconstruction > 0:
             ML_loss = ML_loss + args.reconstruction * cortex.reconstruct_back_down(
                                                                 also_inference=args.reconstruction_also_inference)
+
+        if args.layerwise_reconstruction>0:
+            ML_loss = ML_loss + args.layerwise_reconstruction * cortex.layerwise_reconstructions()
 
         # We could update the discriminator here too, if we want.
         # For efficiency I'm putting it later (in the 'sleep') section
@@ -287,11 +297,6 @@ def train(args, cortex, train_loader, discriminator,
                                      args.gradient_clipping, "inf")
         optimizerG.step()
         optimizerF.step()
-
-
-
-                # print("Max cortex gradient {}".format(get_gradient_stats(cortex)))
-
 
 
 def main(args):
@@ -421,7 +426,9 @@ def main_worker(gpu, ngpus_per_node, args):
                                     normalize = args.divisive_normalization,
                                     he_init=args.he_initialization,
                                     dropout = args.dropout,
-                                    selu = args.selu)
+                                    selu = args.selu,
+                                    deeper_inference = args.deeper_inference,
+                                    noise_before = args.noise_before)
 
     discriminator = Discriminator(image_size, cortex.layer_names,
                                   args.noise_dim, args.n_filters, nc,
@@ -543,7 +550,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                                               args.n_filters,
                                                               args.noise_dim,
                                                               args.data,
-                                                              args.dataset,
+                                                                args.dataset,
                                                               nonlinear = False,
                                                               lr = 1,
                                                               folds = 8,
