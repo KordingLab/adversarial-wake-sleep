@@ -55,19 +55,16 @@ parser.add_argument('--dist-backend', default='nccl', type=str,
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=128, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256)')
-parser.add_argument('--lr-g', default=1e-4, type=float,
+parser.add_argument('--lr-g', default= 1e-3, type=float,
                     metavar='LRC', help='initial learning rate of the generator. Default 1e-4', dest='lr_g')
-parser.add_argument('--lr-d', '--learning-rate-discriminator', default=5e-4, type=float,
-                    metavar='LRD', help='initial learning rate of the discriminator. Default 5e-4', dest='lr_d')
-parser.add_argument('--lr-e',  default=5e-4, type=float,
+
+parser.add_argument('--lr-e',  default= 1e-3, type=float,
                     metavar='LRD', help='initial learning rate of the encoder. Default 5e-4', dest='lr_e')
-parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
-                    metavar='W', help='weight decay (default: 1e-4)',
-                    dest='wd')
-parser.add_argument('--beta1',  default=.5, type=float,
+
+parser.add_argument('--beta1',  default=.9, type=float,
                     help='In the adam optimizer. Default = 0.5')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
                     help='number of total epochs to run. Default 200')
@@ -88,20 +85,15 @@ parser.add_argument('--surprisal-sigma', default=10, type=float,
 
 
 parser.add_argument('--noise-type', default = 'none',
-                    choices= ['none', 'fixed', 'learned_by_layer', 'learned_by_channel', 'learned_filter', 'poisson',],
-                    help="What variance of Gaussian noise should be applied *after* all layers in the "
+                    choices= ['none', 'fixed', 'learned_by_layer', 'learned_by_channel', 'learned_filter',
+                              'exponential', 'poisson',],
+                    help="What variance of noise should be applied *after* all layers in the "
                             "cortex? See docs for details. Default is no noise; fixed has variance 0.01")
 
 
-parser.add_argument('--no-backprop-through-full-cortex', action='store_true',
-                    help='Only backprop through the local (layerwise) discriminator to parameters in that same '
-                     'layer of the cortex. For biological plausibility.')
-parser.add_argument('--only-backprop-generator', action='store_true',
-                    help='Only backprop through the local (layerwise) discriminator to parameters in that same '
-                     'layer of the cortex for the inference. For the generator we backprop all the way to the top.')
-
 parser.add_argument('--quiet', action='store_true',
                     help='Do not print the surprisal stats.')
+
 parser.add_argument('--save-imgs', action='store_true',
                     help='Save the generated images every epoch')
 
@@ -120,21 +112,20 @@ parser.add_argument('--dropout', action='store_true',
 parser.add_argument('--noise-before', action='store_true',
                     help='Add some noise channels *before* transforming up in inference. This is the reparameterization'
                          'trick: we want an approximate posterior but dont care if its nonstandard')
+parser.add_argument('--stochastic-binary', action='store_true',
+                    help='All units are binary units. Weights are stochastic bernoulli. layerwise surprisals are '
+                         'cross entropy')
 
 
-def train(args, cortex, train_loader, discriminator,
+def train(args, cortex, train_loader,
               optimizerG, optimizerF, epoch):
 
     noise_layer = len(cortex.generator.listed_modules)
 
     cortex.train()
-    discriminator.train()
-
 
     for batch, (images, _) in enumerate(train_loader):
         cortex.log_weight_alignment()
-
-        batch_size = images.size()[0]
 
         optimizerG.zero_grad()
         optimizerF.zero_grad()
@@ -153,8 +144,7 @@ def train(args, cortex, train_loader, discriminator,
         # now update generator with the wake-sleep step
         # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
         # with Gaussian we have log p  = MSE between actual and predicted
-        ML_loss = cortex.generator_surprisal()
-        ML_loss.backward()
+        gen_loss = cortex.generator_surprisal()
 
         ############### SLEEP ##################
 
@@ -162,19 +152,19 @@ def train(args, cortex, train_loader, discriminator,
 
         cortex.noise_and_generate(noise_layer)
 
-        if args.soft_div_norm > 0:
-            div_norm_loss = cortex.get_pixelwise_channel_norms() * args.soft_div_norm
-            div_norm_loss.backward(retain_graph = True)
+        cortex.get_pixelwise_channel_norms()
 
-        ML_loss = cortex.inference_surprisal()
-        ML_loss.backward()
+        inf_loss = cortex.inference_surprisal()
+
+        loss = inf_loss + gen_loss
+        loss.backward()
 
         if not args.quiet:
             if batch % 100 == 0:
-                print("Epoch {} Batch {} Overall surprisal {:.2f}".format(epoch, batch, ML_loss.item()))
+                print("Epoch {} Batch {} Gen surprisal {:.2f}  Inf surprisal {:.2f}".format(epoch,
+                                                                                            batch, gen_loss, inf_loss))
         # Clip gradients?
         if args.gradient_clipping > 0:
-            # do them together to not mess with the ratio of learning rates
             nn.utils.clip_grad_norm_(cortex.parameters(),
                                      args.gradient_clipping, "inf")
         optimizerG.step()
@@ -289,10 +279,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # ----- Create models ------ #
 
-    # False if no bp thru cortex, or if only bp gen, else true
-    bp_thru_inf = (not args.no_backprop_through_full_cortex) and (not args.only_backprop_generator)
-    bp_thru_gen = (not args.no_backprop_through_full_cortex)
-
     bn = False
 
 
@@ -304,8 +290,8 @@ def main_worker(gpu, ngpus_per_node, args):
                        batchnorm = bn,
                        dropout = args.dropout,
                        selu = args.selu,
-                       deeper_inference = args.deeper_inference,
-                       noise_before = args.noise_before)
+                       noise_before = args.noise_before,
+                       stochastic_binary = args.stochastic_binary)
 
 
     # get to proper GPU
@@ -339,10 +325,10 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # ------ Build optimizer ------ #
     optimizerG = optim.Adam(cortex.generator.parameters(),
-                     lr=args.lr_g, betas=(args.beta1, 0.999), weight_decay = args.wd,amsgrad = args.amsgrad)
+                     lr=args.lr_g,  betas=(args.beta1, 0.999))
 
     optimizerF = optim.Adam(cortex.inference.parameters(),
-                     lr=args.lr_e, betas=(args.beta1, 0.999), weight_decay = args.wd,amsgrad = args.amsgrad)
+                     lr=args.lr_e,  betas=(args.beta1, 0.999))
 
     # ------ optionally resume from a checkpoint ------- #
     if args.resume:
@@ -378,7 +364,7 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
-        train(args, cortex, train_loader, discriminator,
+        train(args, cortex, train_loader,
               optimizerG, optimizerF, epoch)
         cortex.eval()
 
@@ -395,7 +381,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                     and args.rank % ngpus_per_node == 0):
-            if args.detailed_logging or (epoch == args.epochs-1):
+            if (epoch == args.epochs-1):
                 # how well can we decode from layers?
                 accuracies = decode_classes_from_layers(  args.gpu,
                                                               cortex,
@@ -425,12 +411,11 @@ def main_worker(gpu, ngpus_per_node, args):
                 'args': args,
                 'optimizerG': optimizerG.state_dict(),
                 'optimizerF': optimizerF.state_dict(),
-                'train_history': {"disc_loss" : discriminator.intermediate_Ds,
+                'train_history': {
                                   "surprisals": cortex.intermediate_surprisals,
                                   "reconstructions": cortex.intermediate_reconstructions,
                                   "weight_alignment": cortex.weight_alignment,
                                   "cortex_channel_magnitudes": cortex.channel_norms,
-                                  "discriminator_channel_magnitudes": discriminator.get_channel_norms(),
                                   "decoding_error_history": decoding_error_history}
             }, 'checkpoint.pth.tar')
 

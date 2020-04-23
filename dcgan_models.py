@@ -30,12 +30,13 @@ class Generator(nn.Module):
     
     """
     def __init__(self, noise_dim, n_filters, n_img_channels, noise_type = 'none', backprop_to_start = True,
-                 image_size = 64, batchnorm = False, normalize = False, he_init = False, selu = False, dropout= False):
+                 image_size = 64, batchnorm = False, selu = False, dropout= False, stochastic_binary = False):
         super(Generator, self).__init__()
         self.noise_dim = noise_dim
         self.n_filters = n_filters
         self.n_img_channels = n_img_channels
         self.backprop_to_start = backprop_to_start
+        self.stochastic_binary = stochastic_binary
 
         # A small note regarding he initialization (if used) for those curious:
         # An interesting thing with the ConvTranspose is that the number of effective inputs is not
@@ -45,45 +46,74 @@ class Generator(nn.Module):
         # In the learned_filter mode, all conv layers need to output twice the number of channels as before.
         maybetimestwo = 2 if noise_type=="learned_filter" else 1
 
-        self.generative_5to4_conv = nn.Sequential(
-            # input is Z, going into a convolution
-            nn.ConvTranspose2d(noise_dim, n_filters * 8 * maybetimestwo, image_size//16, 1, 0 ),
-            AddNoise(noise_type, n_filters * 8),
-            nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
-            nn.SELU() if selu else nn.ReLU(),
-            nn.AlphaDropout(.3) if dropout else null())
+        if stochastic_binary:
+            self.generative_5to4_conv = nn.Sequential(
+                # input is Z, going into a convolution
+                nn.ConvTranspose2d(noise_dim, n_filters * 8 * maybetimestwo, image_size // 16, 1, 0),
+                nn.Sigmoid())
 
-        self.generative_4to3_conv = nn.Sequential(
-            # state size. (n_filters*8) x 4 x 4
-            nn.ConvTranspose2d(n_filters * 8, n_filters * 4 * maybetimestwo, 4, 2, 1 ),
-            AddNoise(noise_type, n_filters * 4),
-            nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
-            nn.SELU() if selu else nn.ReLU(),
-            nn.AlphaDropout(.3) if dropout else null())
+            self.generative_4to3_conv = nn.Sequential(
+                # state size. (n_filters*8) x 4 x 4
+                nn.ConvTranspose2d(n_filters * 8, n_filters * 4 * maybetimestwo, 4, 2, 1),
+                nn.Sigmoid())
 
-        self.generative_3to2_conv = nn.Sequential(
-            # state size. (n_filters*4) x 8 x 8
-            nn.ConvTranspose2d(n_filters * 4, n_filters * 2 * maybetimestwo, 4, 2, 1 ),
-            AddNoise(noise_type, n_filters * 2),
-            nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
-            nn.SELU() if selu else  nn.ReLU(),
-            nn.AlphaDropout(.3) if dropout else null())
+            self.generative_3to2_conv = nn.Sequential(
+                # state size. (n_filters*4) x 8 x 8
+                nn.ConvTranspose2d(n_filters * 4, n_filters * 2 * maybetimestwo, 4, 2, 1),
+                nn.Sigmoid())
 
-        self.generative_2to1_conv = nn.Sequential(
-            # state size. (n_filters*2) x 16 x 16
-            nn.ConvTranspose2d(n_filters * 2, n_filters * maybetimestwo, 4, 2, 1 ),
-            AddNoise(noise_type, n_filters),
-            nn.BatchNorm2d(n_filters) if batchnorm else null(),
-            nn.SELU() if selu else nn.ReLU(),
-            nn.AlphaDropout(.3) if dropout else null())
+
+            self.generative_2to1_conv = nn.Sequential(
+                # state size. (n_filters*2) x 16 x 16
+                nn.ConvTranspose2d(n_filters * 2, n_filters * maybetimestwo, 4, 2, 1),
+                nn.Sigmoid())
+
             # state size. (n_filters) x 32 x 32
 
-        self.generative_1to0_conv = nn.Sequential(
-            nn.ConvTranspose2d(n_filters, n_img_channels * maybetimestwo, 4, 2, 1 ),
-            AddNoise(noise_type, n_img_channels),
-            nn.Tanh()
-            # state size. (n_img_channels) x 64 x 64
-        )
+            self.generative_1to0_conv = nn.Sequential(
+                nn.ConvTranspose2d(n_filters, n_img_channels * maybetimestwo, 4, 2, 1),
+                nn.Sigmoid())
+
+        else:
+            self.generative_5to4_conv = nn.Sequential(
+                # input is Z, going into a convolution
+                nn.ConvTranspose2d(noise_dim, n_filters * 8 * maybetimestwo, image_size//16, 1, 0 ),
+                AddNoise(noise_type, n_filters * 8),
+                nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
+                nn.SELU() if selu else nn.ReLU(),
+                nn.AlphaDropout(.3) if dropout else null())
+
+            self.generative_4to3_conv = nn.Sequential(
+                # state size. (n_filters*8) x 4 x 4
+                nn.ConvTranspose2d(n_filters * 8, n_filters * 4 * maybetimestwo, 4, 2, 1 ),
+                AddNoise(noise_type, n_filters * 4),
+                nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
+                nn.SELU() if selu else nn.ReLU(),
+                nn.AlphaDropout(.3) if dropout else null())
+
+            self.generative_3to2_conv = nn.Sequential(
+                # state size. (n_filters*4) x 8 x 8
+                nn.ConvTranspose2d(n_filters * 4, n_filters * 2 * maybetimestwo, 4, 2, 1 ),
+                AddNoise(noise_type, n_filters * 2),
+                nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
+                nn.SELU() if selu else  nn.ReLU(),
+                nn.AlphaDropout(.3) if dropout else null())
+
+            self.generative_2to1_conv = nn.Sequential(
+                # state size. (n_filters*2) x 16 x 16
+                nn.ConvTranspose2d(n_filters * 2, n_filters * maybetimestwo, 4, 2, 1 ),
+                AddNoise(noise_type, n_filters),
+                nn.BatchNorm2d(n_filters) if batchnorm else null(),
+                nn.SELU() if selu else nn.ReLU(),
+                nn.AlphaDropout(.3) if dropout else null())
+                # state size. (n_filters) x 32 x 32
+
+            self.generative_1to0_conv = nn.Sequential(
+                nn.ConvTranspose2d(n_filters, n_img_channels * maybetimestwo, 4, 2, 1 ),
+                AddNoise(noise_type, n_img_channels),
+                nn.Tanh()
+                # state size. (n_img_channels) x 64 x 64
+            )
 
         # list modules bottom to top. Probably a more general way exists
         self.listed_modules = [self.generative_1to0_conv,
@@ -108,6 +138,10 @@ class Generator(nn.Module):
         return detached_dict
 
     def forward(self, x, from_layer = 5, update_states = True):
+
+        if self.stochastic_binary and from_layer==5:
+            x.bernoulli_(.4)
+
         # iterate through layers and pass the noise downwards
         for i, (G, layer_name) in enumerate(zip(self.listed_modules[::-1],
                                                 self.layer_names[:0:-1])):
@@ -121,6 +155,13 @@ class Generator(nn.Module):
             if not self.backprop_to_start:
                 x = x.detach()
             x = G(x)
+
+            if self.stochastic_binary:
+                if self.training:
+                    x = torch.bernoulli(x).detach()
+                else:
+                    x = torch.round(x)
+
         if update_states:
             self.intermediate_state_dict["Input"] = x
 
@@ -129,13 +170,14 @@ class Generator(nn.Module):
 
 class Inference(nn.Module):
     def __init__(self, noise_dim, n_filters, n_img_channels, noise_type = 'none', backprop_to_start = True,
-                 image_size = 64, batchnorm = False, normalize = False, he_init = False, selu=False, dropout = False,
-                 deeper_inference  = False, noise_before = False):
+                 image_size = 64, batchnorm = False, selu=False, dropout = False,
+                 stochastic_binary = False, noise_before = False):
         super(Inference, self).__init__()
         self.noise_dim = noise_dim
         self.n_filters = n_filters
         self.n_img_channels = n_img_channels
         self.backprop_to_start = backprop_to_start
+        self.stochastic_binary = stochastic_binary
 
         # In the learned_filter mode, all conv layers need to output twice the number of channels as before.
         maybetimestwo = 2 if noise_type=="learned_filter" else 1
@@ -143,44 +185,73 @@ class Inference(nn.Module):
         maybenoise = 3 if noise_before else 0
 
         # this would be simple to build programmatically in the future with ModuleList, but explicit for now.
+        if stochastic_binary:
+            self.inference_4to5_conv = nn.Sequential(
+                NoiseChannel() if noise_before else null(),
+                nn.Conv2d(n_filters * 8 + maybenoise, noise_dim * maybetimestwo, image_size // 16, 1, 0),
+                nn.Sigmoid())
 
-        self.inference_4to5_conv = nn.Sequential(
-            NoiseChannel() if noise_before else null(),
-            nn.Conv2d(n_filters * 8 + maybenoise, noise_dim * maybetimestwo, image_size // 16, 1, 0 ),
-            AddNoise(noise_type, noise_dim)
-        )
 
-        self.inference_3to4_conv = nn.Sequential(
-            NoiseChannel() if noise_before else null(),
-            nn.Conv2d(n_filters * 4 + maybenoise, n_filters * 8 * maybetimestwo, 4, 2, 1 ),
-            AddNoise(noise_type, n_filters * 8),
-            nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
-            nn.SELU() if selu else nn.ReLU(),
-            nn.AlphaDropout(.3) if dropout else null())
+            self.inference_3to4_conv = nn.Sequential(
+                NoiseChannel() if noise_before else null(),
+                nn.Conv2d(n_filters * 4 + maybenoise, n_filters * 8 * maybetimestwo, 4, 2, 1),
+                nn.Sigmoid())
 
-        self.inference_2to3_conv = nn.Sequential(
-            NoiseChannel() if noise_before else null(),
-            nn.Conv2d(n_filters * 2 + maybenoise, n_filters * 4 * maybetimestwo, 4, 2, 1 ),
-            AddNoise(noise_type, n_filters * 4),
-            nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
-            nn.SELU() if selu else nn.ReLU(),
-            nn.AlphaDropout(.3) if dropout else null())
+            self.inference_2to3_conv = nn.Sequential(
+                NoiseChannel() if noise_before else null(),
+                nn.Conv2d(n_filters * 2 + maybenoise, n_filters * 4 * maybetimestwo, 4, 2, 1),
+                nn.Sigmoid())
 
-        self.inference_1to2_conv = nn.Sequential(
-            NoiseChannel() if noise_before else null(),
-            nn.Conv2d(n_filters + maybenoise, n_filters * 2 * maybetimestwo, 4, 2, 1 ),
-            AddNoise(noise_type, n_filters * 2),
-            nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
-            nn.SELU() if selu else nn.ReLU(),
-            nn.AlphaDropout(.3) if dropout else null())
 
-        self.inference_0to1_conv = nn.Sequential(
-            NoiseChannel() if noise_before else null(),
-            nn.Conv2d(n_img_channels + maybenoise, n_filters * maybetimestwo, 4, 2, 1 ),
-            AddNoise(noise_type, n_filters),
-            nn.BatchNorm2d(n_filters) if batchnorm else null(),
-            nn.SELU() if selu else nn.ReLU(),
-            nn.AlphaDropout(.3) if dropout else null())
+            self.inference_1to2_conv = nn.Sequential(
+                NoiseChannel() if noise_before else null(),
+                nn.Conv2d(n_filters + maybenoise, n_filters * 2 * maybetimestwo, 4, 2, 1),
+                nn.Sigmoid())
+
+
+            self.inference_0to1_conv = nn.Sequential(
+                NoiseChannel() if noise_before else null(),
+                nn.Conv2d(n_img_channels + maybenoise, n_filters * maybetimestwo, 4, 2, 1),
+                nn.Sigmoid())
+
+        else:
+            self.inference_4to5_conv = nn.Sequential(
+                NoiseChannel() if noise_before else null(),
+                nn.Conv2d(n_filters * 8 + maybenoise, noise_dim * maybetimestwo, image_size // 16, 1, 0 ),
+                AddNoise(noise_type, noise_dim)
+            )
+
+            self.inference_3to4_conv = nn.Sequential(
+                NoiseChannel() if noise_before else null(),
+                nn.Conv2d(n_filters * 4 + maybenoise, n_filters * 8 * maybetimestwo, 4, 2, 1 ),
+                AddNoise(noise_type, n_filters * 8),
+                nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
+                nn.SELU() if selu else nn.ReLU(),
+                nn.AlphaDropout(.3) if dropout else null())
+
+            self.inference_2to3_conv = nn.Sequential(
+                NoiseChannel() if noise_before else null(),
+                nn.Conv2d(n_filters * 2 + maybenoise, n_filters * 4 * maybetimestwo, 4, 2, 1 ),
+                AddNoise(noise_type, n_filters * 4),
+                nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
+                nn.SELU() if selu else nn.ReLU(),
+                nn.AlphaDropout(.3) if dropout else null())
+
+            self.inference_1to2_conv = nn.Sequential(
+                NoiseChannel() if noise_before else null(),
+                nn.Conv2d(n_filters + maybenoise, n_filters * 2 * maybetimestwo, 4, 2, 1 ),
+                AddNoise(noise_type, n_filters * 2),
+                nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
+                nn.SELU() if selu else nn.ReLU(),
+                nn.AlphaDropout(.3) if dropout else null())
+
+            self.inference_0to1_conv = nn.Sequential(
+                NoiseChannel() if noise_before else null(),
+                nn.Conv2d(n_img_channels + maybenoise, n_filters * maybetimestwo, 4, 2, 1 ),
+                AddNoise(noise_type, n_filters),
+                nn.BatchNorm2d(n_filters) if batchnorm else null(),
+                nn.SELU() if selu else nn.ReLU(),
+                nn.AlphaDropout(.3) if dropout else null())
 
 
         # list modules bottom to top. Probably a more general way exists
@@ -204,6 +275,11 @@ class Inference(nn.Module):
         return detached_dict
 
     def forward(self, x):
+        #binarize the input
+        if self.stochastic_binary:
+            # map to [0,1]
+            x = torch.round(x/2+.5)
+
         self.intermediate_state_dict['Input'] = x
         # iterate through layers and pass the input upwards
         for F, layer_name in zip(self.listed_modules,
@@ -212,8 +288,13 @@ class Inference(nn.Module):
             if not self.backprop_to_start:
                 x = x.detach()
 
-            # print(layer_name, x.size())
             x = F(x)
+            if self.stochastic_binary:
+                if self.training:
+                    x = torch.bernoulli(x).detach()
+                else:
+                    x = torch.round(x)
+
             self.intermediate_state_dict[layer_name] = x
 
         return x
@@ -238,33 +319,30 @@ class Helmholtz(nn.Module):
                  backprop_to_start_inf=True,
                  backprop_to_start_gen=True,
                  batchnorm = False,
-                 normalize=False,
-                 he_init = False,
+                 stochastic_binary =False,
                  selu = False,
                  dropout = False,
-                 deeper_inference = False,
                  noise_before = False):
         super(Helmholtz, self).__init__()
 
         assert image_size % 16 == 0
 
         self.inference = Inference(noise_dim, n_filters, n_img_channels, noise_type, backprop_to_start_inf, image_size,
-                                   batchnorm=batchnorm, normalize=normalize, he_init = he_init,
-                                   selu = selu, dropout = dropout, deeper_inference = deeper_inference,
+                                   batchnorm=batchnorm,
+                                   selu = selu, dropout = dropout, stochastic_binary = stochastic_binary,
                                    noise_before = noise_before)
         self.generator = Generator(noise_dim, n_filters, n_img_channels, noise_type, backprop_to_start_gen, image_size,
-                                   batchnorm=batchnorm, normalize=normalize, he_init = he_init,
+                                   batchnorm=batchnorm,stochastic_binary = stochastic_binary,
                                    selu = selu, dropout = dropout)
 
         # init
-        if he_init:
-            self.inference.apply(weights_init_he)
-            self.generator.apply(weights_init_he)
-        else:
-            self.inference.apply(weights_init)
-            self.generator.apply(weights_init)
 
+        self.inference.apply(weights_init)
+        self.generator.apply(weights_init)
+
+        self.surprisal_loss = nn.MSELoss() if stochastic_binary else nn.L1Loss()
         self.mse = nn.MSELoss()
+
         self.surprisal_sigma = surprisal_sigma
 
         self.layer_names = list(self.inference.intermediate_state_dict.keys())
@@ -334,7 +412,7 @@ class Helmholtz(nn.Module):
 
             x = G(upper_h)
 
-            layerwise_surprisal = self.mse(x, lower_h)
+            layerwise_surprisal = self.surprisal_loss(x, lower_h)
 
             if i in self.which_layers:
                 ML_loss = ML_loss + layerwise_surprisal
@@ -367,7 +445,7 @@ class Helmholtz(nn.Module):
 
             F_upper_h = F(lower_h)
 
-            layerwise_surprisal = self.mse(upper_h, F_upper_h)
+            layerwise_surprisal = self.surprisal_loss(upper_h, F_upper_h)
             if i in self.which_layers:
                 ML_loss = ML_loss + layerwise_surprisal
 
@@ -557,7 +635,7 @@ class AddNoise(nn.Module):
             self.log_sigma = nn.Parameter(torch.ones(1) * -2)
         elif self.noise_type == 'learned_by_channel':
             self.log_sigma = nn.Parameter(torch.ones(n_channels) * -2)
-        elif self.noise_type == 'poisson':
+        elif self.noise_type == 'poisson' or self.noise_type == 'exponential':
             self.relu = nn.ReLU()
 
     def forward(self, x):
@@ -592,6 +670,11 @@ class AddNoise(nn.Module):
             elif self.noise_type == 'poisson':
                 noise = torch.empty_like(x).normal_()
                 out = x + noise * self.relu(x) / 10
+            elif self.noise_type == 'exponential':
+                # nice one-liner
+                noise = torch.empty_like(x).uniform_(1e-8,1).reciprocal_().log_()
+                # noise = self.relu(noise - 1)
+                out = x + noise
             else:
                 raise AssertionError("noise_type not in "
                                      "['none', 'fixed', 'learned_by_layer', 'learned_by_channel', "

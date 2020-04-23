@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 
 
-from dcgan_models import DeterministicHelmholtz
+from dcgan_models import Helmholtz
 from decoder_models import LinearDecoder, NonlinearDecoder
 
 import argparse
@@ -120,13 +120,13 @@ def load_cortex(path, args):
     """Loads a cortex from path."""
     bn = False if args.loss_type == 'wasserstein' else True
 
-    cortex = DeterministicHelmholtz(args.noise_dim, args.n_filters,
-                                    1 if args.dataset == 'mnist' else 3,
-                                    image_size=args.image_size,
-                                    noise_type = args.noise_type,
-                                    batchnorm = bn,
-                                    normalize = args.divisive_normalization,
-                                    he_init=args.he_initialization)
+    cortex = Helmholtz(args.noise_dim, args.n_filters,
+                       1 if args.dataset == 'mnist' else 3,
+                       image_size=args.image_size,
+                       noise_type = args.noise_type,
+                       batchnorm = bn,
+                       normalize = args.divisive_normalization,
+                       he_init=args.he_initialization)
 
     if os.path.isfile(path):
         print("=> loading checkpoint '{}'".format(path))

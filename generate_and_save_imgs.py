@@ -7,7 +7,7 @@ from numpy import save
 
 
 
-from dcgan_models import DeterministicHelmholtz
+from dcgan_models import Helmholtz
 
 import argparse
 import os
@@ -36,8 +36,8 @@ def main(args):
     image_size = args.image_size
     noise_dim = args.noise_dim
     n_filters = args.n_filters
-    cortex = DeterministicHelmholtz(noise_dim, n_filters, 3, noise_type=args.noise_type,
-                                    image_size=image_size).eval()
+    cortex = Helmholtz(noise_dim, n_filters, 3, noise_type=args.noise_type,
+                       image_size=image_size).eval()
 
     _ = load_checkpoint(args.path, cortex)
 
