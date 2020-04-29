@@ -218,7 +218,7 @@ class Inference(nn.Module):
             self.inference_4to5_conv = nn.Sequential(
                 NoiseChannel() if noise_before else null(),
                 nn.Conv2d(n_filters * 8 + maybenoise, noise_dim * maybetimestwo, image_size // 16, 1, 0 ),
-                AddNoise(noise_type, noise_dim)
+                AddNoise('none', noise_dim)
             )
 
             self.inference_3to4_conv = nn.Sequential(
@@ -625,19 +625,20 @@ class AddNoise(nn.Module):
 
     """
 
-    def __init__(self, noise_type, n_channels = None, fixed_variance = 0.01):
+    def __init__(self, noise_type, n_channels = None, fixed_variance = .02):
         super(AddNoise, self).__init__()
 
         self.noise_type = noise_type
-        if self.noise_type == 'fixed':
-            self.fixed_variance = fixed_variance
-        elif self.noise_type == 'learned_by_layer':
+        self.fixed_variance = fixed_variance
+        if self.noise_type == 'learned_by_layer':
             self.log_sigma = nn.Parameter(torch.ones(1) * -2)
         elif self.noise_type == 'learned_by_channel':
             self.log_sigma = nn.Parameter(torch.ones(n_channels) * -2)
         elif self.noise_type == 'poisson' or self.noise_type == 'exponential':
             self.relu = nn.ReLU()
-
+            
+        self.decay = 1.
+            
     def forward(self, x):
 
         if self.training:
@@ -645,7 +646,7 @@ class AddNoise(nn.Module):
                 out = x
             elif self.noise_type == 'fixed':
                 noise = torch.empty_like(x).normal_()
-                out = x + noise * self.fixed_variance
+                out = x + noise * self.fixed_variance * self.decay
 
             elif self.noise_type == 'learned_by_layer':
                 noise = torch.empty_like(x).normal_()
@@ -671,13 +672,16 @@ class AddNoise(nn.Module):
                 noise = torch.empty_like(x).normal_()
                 out = x + noise * self.relu(x) / 10
             elif self.noise_type == 'exponential':
-                # nice one-liner
                 noise = torch.empty_like(x).uniform_(1e-8,1).reciprocal_().log_()
                 # noise = self.relu(noise - 1)
-                out = x + noise
+                out = x + self.decay*noise
+            elif self.noise_type == 'laplace':
+                noise = torch.empty_like(x).uniform_(1e-8,1).reciprocal_().log_()
+                noise *= (torch.empty_like(x).bernoulli_()*2)-1
+                out = x + self.decay*noise*self.fixed_variance
             else:
                 raise AssertionError("noise_type not in "
-                                     "['none', 'fixed', 'learned_by_layer', 'learned_by_channel', "
+                                     "['none', 'fixed', 'learned_by_layer', 'learned_by_channel', 'laplace', 'exponential'"
                                      "'poisson', 'learned_filter']")
         elif self.noise_type == 'learned_filter':
             n_channels = x.size()[1]
@@ -686,5 +690,7 @@ class AddNoise(nn.Module):
             out = x[:, :n_channels // 2, :, :]
         else:
             out = x
+            
+#         self.decay *= .9999
             
         return out

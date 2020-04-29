@@ -55,7 +55,7 @@ parser.add_argument('--dist-backend', default='nccl', type=str,
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 
-parser.add_argument('-b', '--batch-size', default=128, type=int,
+parser.add_argument('-b', '--batch-size', default=64, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256)')
 parser.add_argument('--lr-g', default= 1e-3, type=float,
@@ -63,10 +63,11 @@ parser.add_argument('--lr-g', default= 1e-3, type=float,
 
 parser.add_argument('--lr-e',  default= 1e-3, type=float,
                     metavar='LRD', help='initial learning rate of the encoder. Default 5e-4', dest='lr_e')
-
-parser.add_argument('--beta1',  default=.9, type=float,
+parser.add_argument('--wd',  default= 0, type=float,
+                    help='weight decay',)
+parser.add_argument('--beta1',  default=.5, type=float,
                     help='In the adam optimizer. Default = 0.5')
-parser.add_argument('--epochs', default=200, type=int, metavar='N',
+parser.add_argument('--epochs', default=100, type=int, metavar='N',
                     help='number of total epochs to run. Default 200')
 parser.add_argument('--loss-type', default='BCE',
                     choices= ['BCE', 'wasserstein', 'hinge'],
@@ -75,7 +76,7 @@ parser.add_argument('--detailed-logging', action='store_true',
                     help='Whether to store detailed information about training metrics inside of the cortex object')
 parser.add_argument('--noise-dim', default=40, type=int, metavar='ND',
                     help='Dimensionality of the top layer of the cortex.')
-parser.add_argument('--n-filters', default=64, type=int,
+parser.add_argument('--n-filters', default=32, type=int,
                     help='Number of filters in the first conv layer of the DCGAN. Default 64')
 parser.add_argument('--surprisal-sigma', default=10, type=float,
                     metavar='ss', help='How weakly to follow the gradient of the surprisal of the lower layers '
@@ -86,7 +87,7 @@ parser.add_argument('--surprisal-sigma', default=10, type=float,
 
 parser.add_argument('--noise-type', default = 'none',
                     choices= ['none', 'fixed', 'learned_by_layer', 'learned_by_channel', 'learned_filter',
-                              'exponential', 'poisson',],
+                              'exponential', 'poisson','laplace'],
                     help="What variance of noise should be applied *after* all layers in the "
                             "cortex? See docs for details. Default is no noise; fixed has variance 0.01")
 
@@ -151,8 +152,10 @@ def train(args, cortex, train_loader,
         # fantasize
 
         cortex.noise_and_generate(noise_layer)
-
-        cortex.get_pixelwise_channel_norms()
+        
+        div_norm_loss = cortex.get_pixelwise_channel_norms() * args.soft_div_norm
+        if args.soft_div_norm > 0 and not args.stochastic_binary:
+            div_norm_loss.backward(retain_graph = True)
 
         inf_loss = cortex.inference_surprisal()
 
@@ -325,10 +328,10 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # ------ Build optimizer ------ #
     optimizerG = optim.Adam(cortex.generator.parameters(),
-                     lr=args.lr_g,  betas=(args.beta1, 0.999))
+                     lr=args.lr_g,  betas=(args.beta1, 0.999), weight_decay = args.wd)
 
     optimizerF = optim.Adam(cortex.inference.parameters(),
-                     lr=args.lr_e,  betas=(args.beta1, 0.999))
+                     lr=args.lr_e,  betas=(args.beta1, 0.999), weight_decay =args.wd)
 
     # ------ optionally resume from a checkpoint ------- #
     if args.resume:
