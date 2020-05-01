@@ -154,52 +154,39 @@ class Inference(nn.Module):
         # this would be simple to build programmatically in the future with ModuleList, but explicit for now.
 
         self.inference_4to5_conv = nn.Sequential(
+            # InvSELU() if selu else DeReLU(n_filters * 8),
             NoiseChannel() if noise_before else null(),
             nn.Conv2d(n_filters * 8 + maybenoise, noise_dim * maybetimestwo, image_size // 16, 1, 0 ),
-            MaybeHeRescale(n_filters * 8, image_size // 16, rescale=he_init),
-            AddNoise(noise_type, noise_dim)
-        )
+            )
 
         self.inference_3to4_conv = nn.Sequential(
+            # InvSELU() if selu else DeReLU(n_filters * 4),
             NoiseChannel() if noise_before else null(),
             nn.Conv2d(n_filters * 4 + maybenoise, n_filters * 8 * maybetimestwo, 4, 2, 1 ),
-            MaybeHeRescale(n_filters * 4, 4, rescale=he_init),
-            AddNoise(noise_type, n_filters * 8),
-            nn.BatchNorm2d(n_filters * 8) if batchnorm else null(),
-            nn.SELU() if selu else nn.ReLU(),
-            NormalizationLayer() if normalize else null(),
-            nn.AlphaDropout(.3) if dropout else null())
+            nn.SELU() if selu else nn.ReLU())
 
         self.inference_2to3_conv = nn.Sequential(
+            # InvSELU() if selu else DeReLU(n_filters * 2),
             NoiseChannel() if noise_before else null(),
             nn.Conv2d(n_filters * 2 + maybenoise, n_filters * 4 * maybetimestwo, 4, 2, 1 ),
-            MaybeHeRescale(n_filters * 2, 4, rescale=he_init),
-            AddNoise(noise_type, n_filters * 4),
-            nn.BatchNorm2d(n_filters * 4) if batchnorm else null(),
-            nn.SELU() if selu else nn.ReLU(),
-            NormalizationLayer() if normalize else null(),
-            nn.AlphaDropout(.3) if dropout else null())
+            nn.SELU() if selu else nn.ReLU())
 
         self.inference_1to2_conv = nn.Sequential(
+            # InvSELU() if selu else DeReLU(n_filters),
             NoiseChannel() if noise_before else null(),
-            nn.Conv2d(n_filters + maybenoise, n_filters * 2 * maybetimestwo, 4, 2, 1 ),
-            MaybeHeRescale(n_filters, 4, rescale=he_init),
-            AddNoise(noise_type, n_filters * 2),
-            nn.BatchNorm2d(n_filters * 2) if batchnorm else null(),
-            nn.SELU() if selu else nn.ReLU(),
-            NormalizationLayer() if normalize else null(),
-            nn.AlphaDropout(.3) if dropout else null())
+            nn.Conv2d(n_filters + maybenoise, n_filters * 2, 4, 2, 1 ),
+            nn.SELU() if selu else nn.ReLU())
 
         self.inference_0to1_conv = nn.Sequential(
-            NoiseChannel() if noise_before else null(),
-            nn.Conv2d(n_img_channels + maybenoise, n_filters * maybetimestwo, 4, 2, 1 ),
-            MaybeHeRescale(n_img_channels, 4, rescale=he_init),
-            AddNoise(noise_type, n_filters),
-            nn.BatchNorm2d(n_filters) if batchnorm else null(),
+            # ATanh(),
+            NoiseChannel(1) if noise_before else null(),
+            nn.Conv2d(n_img_channels +1 if noise_before else n_img_channels, n_filters * maybetimestwo, 4, 2, 1 ),
             nn.SELU() if selu else nn.ReLU(),
-            NormalizationLayer() if normalize else null(),
-            nn.AlphaDropout(.3) if dropout else null())
+            # nn.Sequential(nn.Conv2d(n_filters,n_filters, 2, 1, 1 ),
+            #               nn.SELU() if selu else nn.ReLU())
+            )
 
+        self.activation = nn.SELU() if selu else nn.ReLU()
 
         # list modules bottom to top. Probably a more general way exists
         self.listed_modules = [self.inference_0to1_conv,
@@ -235,6 +222,41 @@ class Inference(nn.Module):
             self.intermediate_state_dict[layer_name] = x
 
         return x
+
+class DeReLU(nn.Module):
+    """The stochastic "inverse" of a ReLU.
+    Puts random negative noise of learned variance where there used to be zeros. """
+    def __init__(self, input_channels):
+        super(DeReLU, self).__init__()
+
+        self.scale = nn.Parameter(torch.ones(1,input_channels,1,1))
+        self.relu = nn.ReLU()
+
+    def forward(self,x):
+        #exponentially distributed noise
+        noise = -torch.empty_like(x).uniform_(1e-8, 1).reciprocal_().log_() * self.relu(self.scale)
+
+        # place where it's zero
+        out = torch.where(x>0, x, noise)
+        return out
+
+class ATanh(nn.Module):
+    def __init__(self):
+        super(ATanh, self).__init__()
+
+    def forward(self,x):
+        x = torch.clamp(x, -1 + 1e-6, 1 - 1e-6)
+        return torch.log1p(2 * x / (1 - x)) / 2
+
+class InvSELU(nn.Module):
+    def __init__(self):
+        super(InvSELU, self).__init__()
+        self.alpha = 1.6732632423543772848170429916717
+        self.scale = 1.0507009873554804934193349852946
+
+    def forward(self,x):
+        x = torch.clamp(x,min=-self.alpha + 1e-6)
+        return torch.where(x>0, x/self.scale, torch.log1p(x/self.alpha))
 
 
 class DeterministicHelmholtz(nn.Module):
@@ -275,13 +297,10 @@ class DeterministicHelmholtz(nn.Module):
                                    selu = selu, dropout = dropout)
 
         # init
-        if he_init:
-            self.inference.apply(weights_init_he)
-            self.generator.apply(weights_init_he)
-        else:
-            self.inference.apply(weights_init)
-            self.generator.apply(weights_init)
+        self.inference.apply(weights_init)
+        self.generator.apply(weights_init)
 
+        self.surprisal_loss =  nn.L1Loss()
         self.mse = nn.MSELoss()
         self.surprisal_sigma = surprisal_sigma
 
@@ -352,7 +371,7 @@ class DeterministicHelmholtz(nn.Module):
 
             x = G(upper_h)
 
-            layerwise_surprisal = self.mse(x, lower_h)
+            layerwise_surprisal = self.surprisal_loss(x, lower_h)
 
             if i in self.which_layers:
                 ML_loss = ML_loss + layerwise_surprisal
@@ -385,7 +404,7 @@ class DeterministicHelmholtz(nn.Module):
 
             F_upper_h = F(lower_h)
 
-            layerwise_surprisal = self.mse(upper_h, F_upper_h)
+            layerwise_surprisal = self.surprisal_loss(upper_h, F_upper_h)
             if i in self.which_layers:
                 ML_loss = ML_loss + layerwise_surprisal
 
@@ -491,10 +510,16 @@ class DeterministicHelmholtz(nn.Module):
     def log_weight_alignment(self):
         if self.log_weight_alignment_:
             for i, (G, F) in enumerate(zip(self.generator.listed_modules, self.inference.listed_modules)):
-                gen_weight = list(G.parameters())[0]
-                inf_weight = list(F.parameters())[0]
-                if self.noise_before:
-                    inf_weight = inf_weight[:,:-3]
+                for m in F.modules():
+                    if isinstance(m, nn.Conv2d):
+                        inf_weight = m.weight
+                        break
+                for m in G.modules():
+                    if isinstance(m, nn.ConvTranspose2d):
+                        gen_weight = m.weight
+
+                n_channels = gen_weight.size(1)
+                inf_weight = inf_weight[:,:n_channels]
 
                 cosine = torch.nn.CosineSimilarity()(inf_weight.transpose(1, 0).cpu().view(1, -1),
                                                      gen_weight.cpu().view(1, -1))
@@ -813,7 +838,25 @@ class Discriminator(nn.Module):
     def get_channel_norms(self):
         return {i: D.channel_norms for i, D in enumerate(self.Ds[:4])}
 
-    def forward(self, network_state_dict):
+    def adjust_inference_in_sleep(self,cortex, detach_inference):
+        """For each generated layer, we pass up through inference. Then we pass both into the proper
+        discriminator. The idea is have D and F match the posterior on generated samples, too"""
+
+        d = 0
+        for i, D in enumerate(self.Ds):
+
+            h1 = cortex.generator.intermediate_state_dict[self.layer_names[i]].detach()
+            # pass up
+            h2 = cortex.inference.listed_modules[i](h1)
+            if detach_inference:
+                h2 = h2.detach()
+
+            this_d = D(h1, h2).view(-1, 1)
+            d = d + this_d
+
+        return d / float(len(self.Ds))
+
+    def forward(self, network_state_dict, detach_upper = False, detach_lower = False):
         """
 
         """
@@ -827,6 +870,10 @@ class Discriminator(nn.Module):
 
             h1 = network_state_dict[self.layer_names[i]]
             h2 = network_state_dict[self.layer_names[i + 1]]
+            if detach_lower:
+                h1 = h1.detach()
+            if detach_upper:
+                h2 = h2.detach()
 
             this_d = D(h1, h2).view(-1, 1)
             d = d + this_d
@@ -999,7 +1046,7 @@ class NoiseChannel(nn.Module):
 
     def forward(self, x):
         if self.training:
-            noise = torch.empty_like(x)[:,:self.n_channels,:,:].uniform_()
+            noise = torch.empty_like(x)[:,:self.n_channels,:,:].uniform_(1e-8,1).reciprocal_().log_()*0.02
         else:
             noise = torch.zeros_like(x)[:, :self.n_channels, :, :]
         x = torch.cat([x,noise],dim=1)
@@ -1030,18 +1077,20 @@ class AddNoise(nn.Module):
 
     """
 
-    def __init__(self, noise_type, n_channels = None, fixed_variance = 0.01):
+    def __init__(self, noise_type, n_channels = None, fixed_variance = 0.02):
         super(AddNoise, self).__init__()
 
         self.noise_type = noise_type
-        if self.noise_type == 'fixed':
-            self.fixed_variance = fixed_variance
-        elif self.noise_type == 'learned_by_layer':
+
+        self.fixed_variance = fixed_variance
+        if self.noise_type == 'learned_by_layer':
             self.log_sigma = nn.Parameter(torch.ones(1) * -2)
         elif self.noise_type == 'learned_by_channel':
             self.log_sigma = nn.Parameter(torch.ones(n_channels) * -2)
-        elif self.noise_type == 'poisson':
+        elif self.noise_type == 'poisson' or self.noise_type == 'exponential':
             self.relu = nn.ReLU()
+
+        self.decay = 1.
 
     def forward(self, x):
 
@@ -1075,6 +1124,14 @@ class AddNoise(nn.Module):
             elif self.noise_type == 'poisson':
                 noise = torch.empty_like(x).normal_()
                 out = x + noise * self.relu(x) / 10
+            elif self.noise_type == 'exponential':
+                noise = torch.empty_like(x).uniform_(1e-8, 1).reciprocal_().log_()
+                # noise = self.relu(noise - 1)
+                out = x + self.decay * noise
+            elif self.noise_type == 'laplace':
+                noise = torch.empty_like(x).uniform_(1e-8, 1).reciprocal_().log_()
+                noise *= (torch.empty_like(x).bernoulli_() * 2) - 1
+                out = x + self.decay * noise * self.fixed_variance
             else:
                 raise AssertionError("noise_type not in "
                                      "['none', 'fixed', 'learned_by_layer', 'learned_by_channel', "
@@ -1086,7 +1143,8 @@ class AddNoise(nn.Module):
             out = x[:, :n_channels // 2, :, :]
         else:
             out = x
-            
+
+            #         self.decay *= .9999
         return out
 
 

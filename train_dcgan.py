@@ -13,7 +13,7 @@ import torch.distributed as dist
 
 
 from dcgan_models import DeterministicHelmholtz, Discriminator, HistoricalAverageDiscriminatorLoss
-from utils import sv_img, get_gradient_stats
+from utils import sv_img, KLfromSN
 
 import argparse
 import os
@@ -93,7 +93,9 @@ parser.add_argument('--lamda', default=.1, type=float,
                     help='Lambda for the gradient penalty in the WGAN formulation. Only for Wasserstein loss.')
 
 parser.add_argument('--noise-type', default = 'none',
-                    choices= ['none', 'fixed', 'learned_by_layer', 'learned_by_channel', 'learned_filter', 'poisson',],
+                    choices= ['none', 'fixed', 'learned_by_layer',
+                              'learned_by_channel', 'learned_filter',
+                              'exponential', 'poisson','laplace'],
                     help="What variance of Gaussian noise should be applied *after* all layers in the "
                             "cortex? See docs for details. Default is no noise; fixed has variance 0.01")
 
@@ -146,12 +148,20 @@ parser.add_argument('--dropout', action='store_true',
 
 parser.add_argument('--layerwise-reconstruction', default=0, type=float,
                     help='Minimize reconstruction between each layer')
-# parser.add_argument('--deeper-inference', action='store_true',
-#                     help='Have each inference module be a two-layer NN rather than 1')
+parser.add_argument('--deeper-inference', action='store_true',
+                    help='Have each inference module be a two-layer NN rather than 1')
 parser.add_argument('--noise-before', action='store_true',
                     help='Add some noise channels *before* transforming up in inference. This is the reparameterization'
                          'trick: we want an approximate posterior but dont care if its nonstandard')
-
+parser.add_argument('--not-adversarial-generator', action='store_true',
+                    help='The generator is trained only by the maximization, as in strict'
+                         'variational inference.')
+parser.add_argument('--update-ratio', default=1, type=int,
+                    help='How many times to update the discriminator per inference update')
+parser.add_argument('--match-F-on-generated-dist', action='store_true',
+                    help='Pass the generated state one layer up and put through the discriminator.')
+parser.add_argument('--kl-from-sn', action='store_true',
+                    help='Top layer of the output is moved towards the generative prior. Batch statistics.')
 
 def train(args, cortex, train_loader, discriminator,
               optimizerD, optimizerG, optimizerF, epoch):
@@ -161,12 +171,6 @@ def train(args, cortex, train_loader, discriminator,
     cortex.train()
     discriminator.train()
 
-    if args.historical_averaging > 0:
-        ha_loss = HistoricalAverageDiscriminatorLoss(args.historical_averaging)
-        if args.gpu is not None:
-            ha_loss = ha_loss.cuda(args.gpu)
-        else:
-            ha_loss = ha_loss.cuda()
 
 
     for batch, (images, _) in enumerate(train_loader):
@@ -187,27 +191,28 @@ def train(args, cortex, train_loader, discriminator,
         real_samples = Variable(images)
 
         # pass through inference
-        cortex.inference(real_samples)
+        real_out = cortex.inference(real_samples)
 
+        if epoch > 0:
+            # now update generator with the wake-sleep step
+            # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
+            # with Gaussian we have log p  = MSE between actual and predicted
+            ML_loss = 0
+            if args.minimize_generator_surprisal or args.detailed_logging or args.soft_div_norm>0:
+                ML_loss = cortex.generator_surprisal()
+            if args.minimize_generator_surprisal:
+                ML_loss.backward()
 
-        # now update generator with the wake-sleep step
-        # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
-        # with Gaussian we have log p  = MSE between actual and predicted
-        ML_loss = 0
-        if args.minimize_generator_surprisal or args.detailed_logging or args.soft_div_norm>0:
-            ML_loss = cortex.generator_surprisal()
-        if args.minimize_generator_surprisal:
-            ML_loss.backward()
+            aux_loss = 0
+            if args.reconstruction > 0:
+                aux_loss = aux_loss + args.reconstruction * cortex.reconstruct_back_down(
+                                                                    also_inference=args.reconstruction_also_inference)
 
-        if args.reconstruction > 0:
-            ML_loss = ML_loss + args.reconstruction * cortex.reconstruct_back_down(
-                                                                also_inference=args.reconstruction_also_inference)
+            if args.layerwise_reconstruction>0:
+                aux_loss = aux_loss + args.layerwise_reconstruction * cortex.layerwise_reconstructions()
 
-        if args.layerwise_reconstruction>0:
-            ML_loss = ML_loss + args.layerwise_reconstruction * cortex.layerwise_reconstructions()
-
-        # We could update the discriminator here too, if we want.
-        # For efficiency I'm putting it later (in the 'sleep') section
+            if args.kl_from_sn:
+                aux_loss = aux_loss + KLfromSN(real_out)
 
         ############### SLEEP ##################
 
@@ -216,15 +221,17 @@ def train(args, cortex, train_loader, discriminator,
         cortex.noise_and_generate(noise_layer)
 
         if args.soft_div_norm > 0:
-            div_norm_loss = cortex.get_pixelwise_channel_norms() * args.soft_div_norm
-            div_norm_loss.backward(retain_graph = True)
+            aux_loss = aux_loss + cortex.get_pixelwise_channel_norms() * args.soft_div_norm
+            # div_norm_loss.backward(retain_graph = True)
 
         if args.minimize_inference_surprisal:
-            ML_loss = cortex.inference_surprisal()
-            ML_loss.backward()
-        if not args.quiet:
-            if batch % 100 == 0:
-                print("Epoch {} Batch {} Overall surprisal {:.2f}".format(epoch, batch, ML_loss.item()))
+            aux_loss = aux_loss + cortex.inference_surprisal()
+        if epoch > 0 and (args.soft_div_norm > 0 or args.minimize_inference_surprisal):
+            aux_loss.backward(retain_graph = True)
+
+            if not args.quiet:
+                if batch % 100 == 0:
+                    print("Epoch {} Batch {} Overall surprisal {:.2f}".format(epoch, batch, aux_loss.item()))
 
         if args.label_smoothing:
             #with prob .1 we switch the labels
@@ -235,48 +242,74 @@ def train(args, cortex, train_loader, discriminator,
         alpha = alpha.to(real_samples.device)
 
         # check out what the discriminator says
-        if args.loss_type == 'hinge':
-            disc_loss = nn.ReLU()(1.0 - alpha * discriminator(cortex.inference.get_detached_state_dict())).mean() + \
-                        nn.ReLU()(1.0 + alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
+        if epoch > 0:
+            if args.loss_type == 'hinge':
+                disc_loss = nn.ReLU()(1.0 - alpha * discriminator(cortex.inference.get_detached_state_dict())).mean() + \
+                            nn.ReLU()(1.0 + alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
+
+                # train with gradient penalty
+                disc_loss += discriminator.get_gradient_penalty(
+                    cortex.inference.get_detached_state_dict(),
+                    cortex.generator.get_detached_state_dict())
+
+            elif args.loss_type == 'wasserstein':
+                disc_loss = -(alpha * discriminator(cortex.inference.get_detached_state_dict())).mean() + \
+                             (alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
+
+                # train with gradient penalty
+                disc_loss += discriminator.get_gradient_penalty(
+                    cortex.inference.get_detached_state_dict(),
+                    cortex.generator.get_detached_state_dict())
+            else:
+                d_inf = discriminator(cortex.inference.get_detached_state_dict())
+                d_gen = discriminator(cortex.generator.get_detached_state_dict())
+
+                p = .9 if args.label_smoothing else 1
+
+                disc_loss = nn.BCELoss()(d_inf, p * Variable(torch.ones(batch_size, 1).to(real_samples.device))) + \
+                            nn.BCELoss()(d_gen, (1-p) * Variable(torch.ones(batch_size, 1).to(real_samples.device)))
+
+            if args.soft_div_norm > 0:
+                disc_loss = disc_loss + args.soft_div_norm * discriminator.get_total_channel_norm_dist_from_1()
+
+            # now update the inference and generator to fight the discriminator
+            # or maybe just the inference
+
+            if args.not_adversarial_generator:
+                if args.loss_type == 'hinge' or args.loss_type == 'wasserstein':
+                    gen_loss = discriminator(cortex.inference.intermediate_state_dict).mean()
+                else:
+                    gen_loss = nn.BCELoss()(discriminator(cortex.inference.intermediate_state_dict),
+                                            Variable(torch.zeros(batch_size, 1).to(real_samples.device)))
+            else:
+                if args.loss_type == 'hinge' or args.loss_type == 'wasserstein':
+                    gen_loss = -discriminator(cortex.generator.intermediate_state_dict).mean() + \
+                               discriminator(cortex.inference.intermediate_state_dict).mean()
+                else:
+                    gen_loss = nn.BCELoss()(discriminator(cortex.generator.intermediate_state_dict),
+                                            Variable(torch.ones(batch_size, 1).to(real_samples.device))) + \
+                               nn.BCELoss()(discriminator(cortex.inference.intermediate_state_dict),
+                                            Variable(torch.zeros(batch_size, 1).to(real_samples.device)))
+        else:
+            #only look at generated state
+            disc_loss = (alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
 
             # train with gradient penalty
             disc_loss += discriminator.get_gradient_penalty(
                 cortex.inference.get_detached_state_dict(),
                 cortex.generator.get_detached_state_dict())
 
-        elif args.loss_type == 'wasserstein':
-            disc_loss = -(alpha * discriminator(cortex.inference.get_detached_state_dict())).mean() + \
-                         (alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
+            gen_loss = 0
 
-            # train with gradient penalty
-            disc_loss += discriminator.get_gradient_penalty(
-                cortex.inference.get_detached_state_dict(),
-                cortex.generator.get_detached_state_dict())
-        else:
-            d_inf = discriminator(cortex.inference.get_detached_state_dict())
-            d_gen = discriminator(cortex.generator.get_detached_state_dict())
-
-            p = .9 if args.label_smoothing else 1
-
-            disc_loss = nn.BCELoss()(d_inf, p * Variable(torch.ones(batch_size, 1).to(real_samples.device))) + \
-                        nn.BCELoss()(d_gen, (1-p) * Variable(torch.ones(batch_size, 1).to(real_samples.device)))
-
-        if args.historical_averaging > 0:
-            disc_loss = disc_loss + ha_loss(discriminator)
-
-        if args.soft_div_norm > 0:
-            disc_loss = disc_loss + args.soft_div_norm * discriminator.get_total_channel_norm_dist_from_1()
-
-        # now update the inference and generator to fight the discriminator
-
-        if args.loss_type == 'hinge' or args.loss_type == 'wasserstein':
-            gen_loss = -discriminator(cortex.generator.intermediate_state_dict).mean() + \
-                       discriminator(cortex.inference.intermediate_state_dict).mean()
-        else:
-            gen_loss = nn.BCELoss()(discriminator(cortex.generator.intermediate_state_dict),
-                                    Variable(torch.ones(batch_size, 1).to(real_samples.device))) + \
-                       nn.BCELoss()(discriminator(cortex.inference.intermediate_state_dict),
-                                    Variable(torch.zeros(batch_size, 1).to(real_samples.device)))
+        if args.match_F_on_generated_dist:
+            disc_on_pass_up = alpha * discriminator.adjust_inference_in_sleep(cortex, detach_inference = True)
+            # max D min F
+            disc_loss = disc_loss - disc_on_pass_up.mean()
+            # I know this is inefficient; we pass up twice. Better would be to backward with retain_graph
+            # zero_grad the inference, step discriminator, and then backward the negative.
+            # however the zero grad would erase the soft-div-norm and inference surprisal... I'll clean later
+            disc_on_pass_up = discriminator.adjust_inference_in_sleep(cortex, detach_inference = False)
+            gen_loss = gen_loss + disc_on_pass_up.mean()
 
 
         disc_loss.backward()
@@ -289,13 +322,21 @@ def train(args, cortex, train_loader, discriminator,
 
         optimizerD.step()
 
-        gen_loss.backward()
+        # if epoch==0:
+        #     optimizerG.step()
+        #     optimizerF.step()
+        # else:
         # Clip gradients?
+        gen_loss.backward()
+
         if args.gradient_clipping > 0:
             # do them together to not mess with the ratio of learning rates
-            nn.utils.clip_grad_norm_(cortex.parameters(),
+            nn.utils.clip_grad_norm_(cortex.inference.parameters(),
                                      args.gradient_clipping, "inf")
-        optimizerG.step()
+
+        if batch % args.update_ratio == 0 and epoch>0:
+            optimizerG.step()
+
         optimizerF.step()
 
 
@@ -336,9 +377,8 @@ def main_worker(gpu, ngpus_per_node, args):
 
 
 
-    # NO so to use multiprocessing, the module we're calling it on needs to ever just be called as forward.'
-    # No usage of calling its internal methods
-    # The solution will be to multiprocessing wrap each of the methods we will ever call.
+    if args.not_adversarial_generator:
+        assert args.minimize_generator_surprisal
 
     args.gpu = gpu
 
@@ -542,7 +582,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                     and args.rank % ngpus_per_node == 0):
-            if args.detailed_logging or (epoch == args.epochs-1):
+            if (epoch == args.epochs-1):
                 # how well can we decode from layers?
                 accuracies = decode_classes_from_layers(  args.gpu,
                                                               cortex,
