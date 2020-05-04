@@ -156,34 +156,45 @@ class Inference(nn.Module):
         self.inference_4to5_conv = nn.Sequential(
             # InvSELU() if selu else DeReLU(n_filters * 8),
             NoiseChannel() if noise_before else null(),
-            nn.Conv2d(n_filters * 8 + maybenoise, noise_dim * maybetimestwo, image_size // 16, 1, 0 ),
+            nn.Conv2d(n_filters * 8 + maybenoise, noise_dim, image_size // 16, 1, 0 ),
+            nn.SELU() if selu else nn.ReLU(),
+            nn.Conv2d(noise_dim, noise_dim, 1, 1, 0),
             )
 
         self.inference_3to4_conv = nn.Sequential(
             # InvSELU() if selu else DeReLU(n_filters * 4),
             NoiseChannel() if noise_before else null(),
-            nn.Conv2d(n_filters * 4 + maybenoise, n_filters * 8 * maybetimestwo, 4, 2, 1 ),
-            nn.SELU() if selu else nn.ReLU())
+            nn.Conv2d(n_filters * 4 + maybenoise, n_filters * 8, 4, 2, 1 ),
+            nn.SELU() if selu else nn.ReLU(),
+            nn.Conv2d(n_filters * 8, n_filters * 8, 1, 1, 0),
+            nn.SELU() if selu else nn.ReLU(),
+        )
 
         self.inference_2to3_conv = nn.Sequential(
             # InvSELU() if selu else DeReLU(n_filters * 2),
             NoiseChannel() if noise_before else null(),
-            nn.Conv2d(n_filters * 2 + maybenoise, n_filters * 4 * maybetimestwo, 4, 2, 1 ),
-            nn.SELU() if selu else nn.ReLU())
+            nn.Conv2d(n_filters * 2 + maybenoise, n_filters * 4, 4, 2, 1 ),
+            nn.SELU() if selu else nn.ReLU(),
+            nn.Conv2d(n_filters * 4, n_filters * 4, 1, 1, 0),
+            nn.SELU() if selu else nn.ReLU(),
+        )
 
         self.inference_1to2_conv = nn.Sequential(
             # InvSELU() if selu else DeReLU(n_filters),
             NoiseChannel() if noise_before else null(),
             nn.Conv2d(n_filters + maybenoise, n_filters * 2, 4, 2, 1 ),
-            nn.SELU() if selu else nn.ReLU())
+            nn.SELU() if selu else nn.ReLU(),
+            nn.Conv2d(n_filters * 2, n_filters * 2, 1, 1, 0),
+            nn.SELU() if selu else nn.ReLU(),
+        )
 
         self.inference_0to1_conv = nn.Sequential(
             # ATanh(),
             NoiseChannel(1) if noise_before else null(),
             nn.Conv2d(n_img_channels +1 if noise_before else n_img_channels, n_filters * maybetimestwo, 4, 2, 1 ),
             nn.SELU() if selu else nn.ReLU(),
-            # nn.Sequential(nn.Conv2d(n_filters,n_filters, 2, 1, 1 ),
-            #               nn.SELU() if selu else nn.ReLU())
+            nn.Conv2d(n_filters, n_filters, 1, 1, 0),
+            nn.SELU() if selu else nn.ReLU(),
             )
 
         self.activation = nn.SELU() if selu else nn.ReLU()
@@ -222,41 +233,41 @@ class Inference(nn.Module):
             self.intermediate_state_dict[layer_name] = x
 
         return x
-
-class DeReLU(nn.Module):
-    """The stochastic "inverse" of a ReLU.
-    Puts random negative noise of learned variance where there used to be zeros. """
-    def __init__(self, input_channels):
-        super(DeReLU, self).__init__()
-
-        self.scale = nn.Parameter(torch.ones(1,input_channels,1,1))
-        self.relu = nn.ReLU()
-
-    def forward(self,x):
-        #exponentially distributed noise
-        noise = -torch.empty_like(x).uniform_(1e-8, 1).reciprocal_().log_() * self.relu(self.scale)
-
-        # place where it's zero
-        out = torch.where(x>0, x, noise)
-        return out
-
-class ATanh(nn.Module):
-    def __init__(self):
-        super(ATanh, self).__init__()
-
-    def forward(self,x):
-        x = torch.clamp(x, -1 + 1e-6, 1 - 1e-6)
-        return torch.log1p(2 * x / (1 - x)) / 2
-
-class InvSELU(nn.Module):
-    def __init__(self):
-        super(InvSELU, self).__init__()
-        self.alpha = 1.6732632423543772848170429916717
-        self.scale = 1.0507009873554804934193349852946
-
-    def forward(self,x):
-        x = torch.clamp(x,min=-self.alpha + 1e-6)
-        return torch.where(x>0, x/self.scale, torch.log1p(x/self.alpha))
+#
+# class DeReLU(nn.Module):
+#     """The stochastic "inverse" of a ReLU.
+#     Puts random negative noise of learned variance where there used to be zeros. """
+#     def __init__(self, input_channels):
+#         super(DeReLU, self).__init__()
+#
+#         self.scale = nn.Parameter(torch.ones(1,input_channels,1,1))
+#         self.relu = nn.ReLU()
+#
+#     def forward(self,x):
+#         #exponentially distributed noise
+#         noise = -torch.empty_like(x).uniform_(1e-8, 1).reciprocal_().log_() * self.relu(self.scale)
+#
+#         # place where it's zero
+#         out = torch.where(x>0, x, noise)
+#         return out
+#
+# class ATanh(nn.Module):
+#     def __init__(self):
+#         super(ATanh, self).__init__()
+#
+#     def forward(self,x):
+#         x = torch.clamp(x, -1 + 1e-6, 1 - 1e-6)
+#         return torch.log1p(2 * x / (1 - x)) / 2
+#
+# class InvSELU(nn.Module):
+#     def __init__(self):
+#         super(InvSELU, self).__init__()
+#         self.alpha = 1.6732632423543772848170429916717
+#         self.scale = 1.0507009873554804934193349852946
+#
+#     def forward(self,x):
+#         x = torch.clamp(x,min=-self.alpha + 1e-6)
+#         return torch.where(x>0, x/self.scale, torch.log1p(x/self.alpha))
 
 
 class DeterministicHelmholtz(nn.Module):
@@ -901,7 +912,7 @@ class Discriminator(nn.Module):
         return gp / float(len(self.Ds))
 
 
-def calc_gradient_penalty(netD, real_data_tuple, fake_data_tuple, LAMBDA=.1):
+def calc_gradient_penalty(netD, real_data_tuple, fake_data_tuple, LAMBDA=.1, p=2):
     """A general utility function modified from a WGAN-GP implementation.
 
     Not pretty rn; TODO make prettier"""
@@ -922,8 +933,8 @@ def calc_gradient_penalty(netD, real_data_tuple, fake_data_tuple, LAMBDA=.1):
 
     gradients0, gradients1 = gradients0.view(batch_size, -1), gradients1.view(batch_size, -1)
 
-    gradient_penalty = ((gradients0.norm(2, dim=1) - 1) ** 2 +
-                        (gradients1.norm(2, dim=1) - 1) ** 2).mean() * LAMBDA
+    gradient_penalty = ((gradients0.norm(p, dim=1) - 1) ** p +
+                        (gradients1.norm(p, dim=1) - 1) ** p).mean() * LAMBDA
     return gradient_penalty
 
 

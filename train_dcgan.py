@@ -193,26 +193,25 @@ def train(args, cortex, train_loader, discriminator,
         # pass through inference
         real_out = cortex.inference(real_samples)
 
-        if epoch > 0:
-            # now update generator with the wake-sleep step
-            # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
-            # with Gaussian we have log p  = MSE between actual and predicted
-            ML_loss = 0
-            if args.minimize_generator_surprisal or args.detailed_logging or args.soft_div_norm>0:
-                ML_loss = cortex.generator_surprisal()
-            if args.minimize_generator_surprisal:
-                ML_loss.backward()
+        # now update generator with the wake-sleep step
+        # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
+        # with Gaussian we have log p  = MSE between actual and predicted
+        ML_loss = 0
+        if args.minimize_generator_surprisal or args.detailed_logging or args.soft_div_norm>0:
+            ML_loss = cortex.generator_surprisal()
+        if args.minimize_generator_surprisal:
+            ML_loss.backward()
 
-            aux_loss = 0
-            if args.reconstruction > 0:
-                aux_loss = aux_loss + args.reconstruction * cortex.reconstruct_back_down(
-                                                                    also_inference=args.reconstruction_also_inference)
+        aux_loss = 0
+        if args.reconstruction > 0:
+            aux_loss = aux_loss + args.reconstruction * cortex.reconstruct_back_down(
+                                                                also_inference=args.reconstruction_also_inference)
 
-            if args.layerwise_reconstruction>0:
-                aux_loss = aux_loss + args.layerwise_reconstruction * cortex.layerwise_reconstructions()
+        if args.layerwise_reconstruction>0:
+            aux_loss = aux_loss + args.layerwise_reconstruction * cortex.layerwise_reconstructions()
 
-            if args.kl_from_sn:
-                aux_loss = aux_loss + KLfromSN(real_out)
+        if args.kl_from_sn:
+            aux_loss = aux_loss + KLfromSN(real_out)
 
         ############### SLEEP ##################
 
@@ -226,7 +225,7 @@ def train(args, cortex, train_loader, discriminator,
 
         if args.minimize_inference_surprisal:
             aux_loss = aux_loss + cortex.inference_surprisal()
-        if epoch > 0 and (args.soft_div_norm > 0 or args.minimize_inference_surprisal):
+        if (args.soft_div_norm > 0 or args.minimize_inference_surprisal):
             aux_loss.backward(retain_graph = True)
 
             if not args.quiet:
@@ -242,64 +241,55 @@ def train(args, cortex, train_loader, discriminator,
         alpha = alpha.to(real_samples.device)
 
         # check out what the discriminator says
-        if epoch > 0:
-            if args.loss_type == 'hinge':
-                disc_loss = nn.ReLU()(1.0 - alpha * discriminator(cortex.inference.get_detached_state_dict())).mean() + \
-                            nn.ReLU()(1.0 + alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
-
-                # train with gradient penalty
-                disc_loss += discriminator.get_gradient_penalty(
-                    cortex.inference.get_detached_state_dict(),
-                    cortex.generator.get_detached_state_dict())
-
-            elif args.loss_type == 'wasserstein':
-                disc_loss = -(alpha * discriminator(cortex.inference.get_detached_state_dict())).mean() + \
-                             (alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
-
-                # train with gradient penalty
-                disc_loss += discriminator.get_gradient_penalty(
-                    cortex.inference.get_detached_state_dict(),
-                    cortex.generator.get_detached_state_dict())
-            else:
-                d_inf = discriminator(cortex.inference.get_detached_state_dict())
-                d_gen = discriminator(cortex.generator.get_detached_state_dict())
-
-                p = .9 if args.label_smoothing else 1
-
-                disc_loss = nn.BCELoss()(d_inf, p * Variable(torch.ones(batch_size, 1).to(real_samples.device))) + \
-                            nn.BCELoss()(d_gen, (1-p) * Variable(torch.ones(batch_size, 1).to(real_samples.device)))
-
-            if args.soft_div_norm > 0:
-                disc_loss = disc_loss + args.soft_div_norm * discriminator.get_total_channel_norm_dist_from_1()
-
-            # now update the inference and generator to fight the discriminator
-            # or maybe just the inference
-
-            if args.not_adversarial_generator:
-                if args.loss_type == 'hinge' or args.loss_type == 'wasserstein':
-                    gen_loss = discriminator(cortex.inference.intermediate_state_dict).mean()
-                else:
-                    gen_loss = nn.BCELoss()(discriminator(cortex.inference.intermediate_state_dict),
-                                            Variable(torch.zeros(batch_size, 1).to(real_samples.device)))
-            else:
-                if args.loss_type == 'hinge' or args.loss_type == 'wasserstein':
-                    gen_loss = -discriminator(cortex.generator.intermediate_state_dict).mean() + \
-                               discriminator(cortex.inference.intermediate_state_dict).mean()
-                else:
-                    gen_loss = nn.BCELoss()(discriminator(cortex.generator.intermediate_state_dict),
-                                            Variable(torch.ones(batch_size, 1).to(real_samples.device))) + \
-                               nn.BCELoss()(discriminator(cortex.inference.intermediate_state_dict),
-                                            Variable(torch.zeros(batch_size, 1).to(real_samples.device)))
-        else:
-            #only look at generated state
-            disc_loss = (alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
+        if args.loss_type == 'hinge':
+            disc_loss = nn.ReLU()(1.0 - alpha * discriminator(cortex.inference.get_detached_state_dict())).mean() + \
+                        nn.ReLU()(1.0 + alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
 
             # train with gradient penalty
             disc_loss += discriminator.get_gradient_penalty(
                 cortex.inference.get_detached_state_dict(),
                 cortex.generator.get_detached_state_dict())
 
-            gen_loss = 0
+        elif args.loss_type == 'wasserstein':
+            disc_loss = -(alpha * discriminator(cortex.inference.get_detached_state_dict())).mean() + \
+                         (alpha * discriminator(cortex.generator.get_detached_state_dict())).mean()
+
+            # train with gradient penalty
+            disc_loss += discriminator.get_gradient_penalty(
+                cortex.inference.get_detached_state_dict(),
+                cortex.generator.get_detached_state_dict())
+        else:
+            d_inf = discriminator(cortex.inference.get_detached_state_dict())
+            d_gen = discriminator(cortex.generator.get_detached_state_dict())
+
+            p = .9 if args.label_smoothing else 1
+
+            disc_loss = nn.BCELoss()(d_inf, p * Variable(torch.ones(batch_size, 1).to(real_samples.device))) + \
+                        nn.BCELoss()(d_gen, (1-p) * Variable(torch.ones(batch_size, 1).to(real_samples.device)))
+
+        if args.soft_div_norm > 0:
+            disc_loss = disc_loss + args.soft_div_norm * discriminator.get_total_channel_norm_dist_from_1()
+
+        # now update the inference and generator to fight the discriminator
+
+        # or maybe just the inference
+
+        if args.not_adversarial_generator:
+            if args.loss_type == 'hinge' or args.loss_type == 'wasserstein':
+                gen_loss = discriminator(cortex.inference.intermediate_state_dict).mean()
+            else:
+                gen_loss = nn.BCELoss()(discriminator(cortex.inference.intermediate_state_dict),
+                                        Variable(torch.zeros(batch_size, 1).to(real_samples.device)))
+        else:
+            if args.loss_type == 'hinge' or args.loss_type == 'wasserstein':
+                gen_loss = -discriminator(cortex.generator.intermediate_state_dict).mean() + \
+                           discriminator(cortex.inference.intermediate_state_dict).mean()
+            else:
+                gen_loss = nn.BCELoss()(discriminator(cortex.generator.intermediate_state_dict),
+                                        Variable(torch.ones(batch_size, 1).to(real_samples.device))) + \
+                           nn.BCELoss()(discriminator(cortex.inference.intermediate_state_dict),
+                                        Variable(torch.zeros(batch_size, 1).to(real_samples.device)))
+
 
         if args.match_F_on_generated_dist:
             disc_on_pass_up = alpha * discriminator.adjust_inference_in_sleep(cortex, detach_inference = True)
@@ -334,7 +324,7 @@ def train(args, cortex, train_loader, discriminator,
             nn.utils.clip_grad_norm_(cortex.inference.parameters(),
                                      args.gradient_clipping, "inf")
 
-        if batch % args.update_ratio == 0 and epoch>0:
+        if batch % args.update_ratio == 0:
             optimizerG.step()
 
         optimizerF.step()
