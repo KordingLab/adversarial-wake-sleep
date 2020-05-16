@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
 from collections import OrderedDict
-from torch.distributions import Laplace, Normal
 from torch.autograd import Variable, grad
 import math
 from numpy import prod
-from utils import stdDev
+from utils import stdDev, weights_init
 
 class Generator(nn.Module):
     """ The feedback edges of the cortex. Generates images with the DCGAN architecture.
@@ -67,7 +66,10 @@ class Generator(nn.Module):
         self.layer_names = list(self.intermediate_state_dict.keys())
         weights_init(self)
 
-    def forward(self, x, from_layer=5, update_states=True, sigma2=0.01):
+        # noise applied
+        self.sigma2 = 0.01
+
+    def forward(self, x, from_layer=5, update_states=True):
         x = self.normalizer(x)
 
         # iterate through layers and pass the noise downwards
@@ -85,7 +87,7 @@ class Generator(nn.Module):
             if layer_name != "Layer1":
                 x = self.normalizer(x)
                 if self.training:
-                    noise = torch.empty_like(x).normal_()*sigma2
+                    noise = torch.empty_like(x).normal_() * self.sigma2
                     x += noise
             x = self.activations[layer_name](x)
 
@@ -95,8 +97,8 @@ class Generator(nn.Module):
         return x
 
 class Inference(nn.Module):
-    def __init__(self, n_latents, n_filters, n_img_channels, image_size = 32,
-                            noise_before=False, hard_norm=False, spec_norm=True):
+    def __init__(self, n_latents, n_filters, n_img_channels, image_size = 32, bn = True,
+                            noise_before=False, hard_norm=False, spec_norm=True, derelu = True):
         super(Inference, self).__init__()
         self.n_latents = n_latents
         self.n_filters = n_filters
@@ -104,12 +106,16 @@ class Inference(nn.Module):
         p1=1 if noise_before else 0
         self.noise_before = noise_before
 
-        self.inference_5from4_conv = BasicBlock(n_filters * 8 + p1, n_latents, image_size//16, 1, 0, spec_norm = spec_norm )
-        self.inference_4from3_conv = BasicBlock(n_filters * 4 + p1, n_filters * 8, 4, 2, 1, spec_norm = spec_norm )
-        self.inference_3from2_conv = BasicBlock(n_filters * 2 + p1, n_filters * 4, 4, 2, 1, spec_norm = spec_norm )
-        self.inference_2from1_conv = BasicBlock(n_filters + p1, n_filters * 2,     4, 2, 1, spec_norm = spec_norm )
+        self.inference_5from4_conv = BasicBlock(n_filters * 8 + p1, n_latents, image_size//16, 1, 0,
+                                                spec_norm = spec_norm, bn=bn, derelu = derelu)
+        self.inference_4from3_conv = BasicBlock(n_filters * 4 + p1, n_filters * 8, 4, 2, 1,
+                                                spec_norm = spec_norm, bn=bn, derelu = derelu)
+        self.inference_3from2_conv = BasicBlock(n_filters * 2 + p1, n_filters * 4, 4, 2, 1,
+                                                spec_norm = spec_norm, bn=bn, derelu = derelu)
+        self.inference_2from1_conv = BasicBlock(n_filters + p1, n_filters * 2,     4, 2, 1,
+                                                spec_norm = spec_norm, bn=bn, derelu = derelu)
         self.inference_1from0_conv = BasicBlock(n_img_channels + p1, n_filters   , 4, 2, 1, derelu=False,
-                                                                                            spec_norm = spec_norm )
+                                                 bn=bn, spec_norm = spec_norm )
 
         self.normalizer = NormalizationLayer() if hard_norm else null()
 
@@ -133,28 +139,34 @@ class Inference(nn.Module):
         self.layer_names = list(self.intermediate_state_dict.keys())
         weights_init(self)
 
-    def forward(self, x, ):
+        #noise applied after each conv
+        self.sigma2 = 0.01
+
+    def forward(self, x, to_layer=5, update_states=True):
         self.intermediate_state_dict['Input'] = x
         # iterate through layers and pass the input upwards
-        for F, layer_name in zip(self.listed_modules,
-                                 self.layer_names[1:]):
+        for i, (F, layer_name) in enumerate(zip(self.listed_modules,
+                                                self.layer_names[1:])):
+
+            if i >= to_layer:
+                continue
             if self.noise_before:
                 if self.training:
                     noise = torch.empty(x.size(0), 1, x.size(2), x.size(3)).normal_().to(x.device)
                 else:
                     noise = torch.zeros(x.size(0), 1, x.size(2), x.size(3)).to(x.device)
                 x = torch.cat([x, noise], dim=1)
-            x = F(x)
+            x = F(x, self.sigma2)
 
             x = self.activations[layer_name](x)
             x = self.normalizer(x)
-
-            self.intermediate_state_dict[layer_name] = x
+            if update_states:
+                self.intermediate_state_dict[layer_name] = x
 
         return x
 
 class BasicBlock(nn.Module):
-    def __init__(self, inplanes, planes, kernel, stride, padding, derelu=True, spec_norm = False):
+    def __init__(self, inplanes, planes, kernel, stride, padding, derelu=True, spec_norm = False, bn = True):
         super(BasicBlock, self).__init__()
         norm_layer = nn.BatchNorm2d
         self.planes = planes
@@ -162,24 +174,24 @@ class BasicBlock(nn.Module):
             self.conv1 = nn.utils.spectral_norm(nn.Conv2d(inplanes, planes, kernel, stride, padding, bias=False))
         else:
             self.conv1 = nn.Conv2d(inplanes, planes, kernel, stride, padding, bias=False)
-        self.bn1 = norm_layer(planes)
+        self.bn1 = norm_layer(planes) if bn else null()
         self.derelu = DeReLU(inplanes) if derelu else null()
 
 
-    def forward(self, out):
+    def forward(self, out, sigma2 = 0.01):
         out = self.derelu(out)
 
         out = self.conv1(out)
         out = self.bn1(out)
 
-        noise = torch.empty_like(out).normal_() * .01
+        noise = torch.empty_like(out).normal_() * sigma2
         out = out + noise
 
         return out
 
 class DeReLU(nn.Module):
     """The stochastic "inverse" of a ReLU.
-    Puts random negative noise of learned variance where there used to be zeros. """
+    Puts random negative noise where there used to be zeros. """
     def __init__(self, input_channels):
         super(DeReLU, self).__init__()
 
@@ -205,7 +217,8 @@ class null(nn.Module):
 class Discriminator(nn.Module):
     """Takes both the input and latent state."""
 
-    def __init__(self, n_latents, n_filters, n_img_channels, image_size=32, hidden_dim=100, hard_norm=False):
+    def __init__(self, n_latents, n_filters, n_img_channels, image_size=32, hidden_dim=100, hard_norm=False,
+                                dropout = 0):
         super(Discriminator, self).__init__()
 
         self.linear01 = (nn.Linear(n_img_channels * image_size ** 2 + n_filters * (image_size//2) ** 2 + 2, hidden_dim))
@@ -215,10 +228,9 @@ class Discriminator(nn.Module):
         self.linear45 = (nn.Linear(n_filters * 8 * (image_size//16) ** 2 + n_latents + 2, hidden_dim))
 
         self.linear2 = (nn.Linear(hidden_dim * 5, 1))
-        self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
+        self.relu = nn.LeakyReLU()
         self.normalizer = NormalizationLayer() if hard_norm else null()
-        self.dropout = nn.Dropout(.4)
+        self.dropout = nn.Dropout(dropout)
 
         weights_init(self)
 
@@ -235,40 +247,29 @@ class Discriminator(nn.Module):
         x = self.dropout(x)
         x = self.normalizer(x)
         x = self.linear2(x)
-        #         x = self.sigmoid(x)
 
         return x
 
 
-def weights_init(net):
-    for m in net.modules():
-        if isinstance(m, nn.Conv2d):
-            m.weight.data.normal_(0, 0.02)
-            if m.bias is not None:
-                m.bias.data.zero_()
-        elif isinstance(m, nn.ConvTranspose2d):
-            m.weight.data.normal_(0, 0.02)
-            if m.bias is not None:
-                m.bias.data.zero_()
-        elif isinstance(m, nn.Linear):
-            m.weight.data.normal_(0, 0.02)
-            if m.bias is not None:
-                m.bias.data.zero_()
+class ReadoutDiscriminator(nn.Module):
+    def __init__(self, n_filters, image_size,
+                 spec_norm=True):
+        super(ReadoutDiscriminator, self).__init__()
+        # number of features in the top level (before latents)
+        self.n_features = n_filters * 8 * (image_size // 16) ** 2
+        if spec_norm:
+            self.readout = nn.utils.spectral_norm(nn.Linear(self.n_features + 1, 1))
+        else:
+            self.readout = nn.Linear(self.n_features + 1, 1)
 
-def weights_init_he(net):
-    for m in net.modules():
-        if isinstance(m, nn.Conv2d):
-            m.weight.data.normal_(0, 1)
-            if m.bias is not None:
-                m.bias.data.zero_()
-        elif isinstance(m, nn.ConvTranspose2d):
-            m.weight.data.normal_(0, 1)
-            if m.bias is not None:
-                m.bias.data.zero_()
-        elif isinstance(m, nn.Linear):
-            m.weight.data.normal_(0, 1)
-            if m.bias is not None:
-                m.bias.data.zero_()
+        weights_init(self)
+
+    def forward(self, inference_layer):
+
+        x = self.readout(stdDev(inference_layer.view(-1, self.n_features)))
+
+        return x
+
 
 class NoiseChannel(nn.Module):
     """Adds some additional channels that are pure uniform noise"""

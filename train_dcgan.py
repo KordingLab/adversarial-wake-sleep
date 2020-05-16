@@ -12,8 +12,8 @@ import torch.distributed as dist
 
 
 
-from dcgan_models import Inference, Generator, Discriminator
-from utils import sv_img, KLfromSN, gen_surprisal, get_detached_state_dict, get_gradient_penalty, get_pixelwise_channel_norms
+from dcgan_models import Inference, Generator, Discriminator, ReadoutDiscriminator
+from utils import sv_img, KLfromSN, gen_surprisal, get_detached_state_dict, get_gradient_penalty, get_gradient_penalty_inputs
 
 import argparse
 import os
@@ -59,15 +59,19 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256)')
 parser.add_argument('--lr-g', default=1e-4, type=float,
-                    metavar='LRC', help='initial learning rate of the generator. Default 1e-4', dest='lr_g')
+                    help='initial learning rate of the generator. Default 1e-4', dest='lr_g')
 parser.add_argument('--lr-d', '--learning-rate-discriminator', default=1e-4, type=float,
-                    metavar='LRD', help='initial learning rate of the discriminator. Default 5e-4', dest='lr_d')
+                    help='initial learning rate of the VI discriminator.', dest='lr_d')
 parser.add_argument('--lr-e',  default=1e-4, type=float,
-                    metavar='LRD', help='initial learning rate of the encoder. Default 5e-4', dest='lr_e')
+                    help='initial learning rate of the encoder', dest='lr_e')
+parser.add_argument('--lr-rd',  default=1e-4, type=float,
+                    help='initial learning rate of the readout discriminator')
 parser.add_argument('--wd', '--weight-decay', default=0, type=float,
                     metavar='W', help='weight decay (default: 0)',
                     dest='wd')
 parser.add_argument('--beta1',  default=.5, type=float,
+                    help='In the adam optimizer. Default = 0.5')
+parser.add_argument('--beta2',  default=.99, type=float,
                     help='In the adam optimizer. Default = 0.5')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
                     help='number of total epochs to run. Default 200')
@@ -113,9 +117,17 @@ parser.add_argument('--spectral-norm', default='False',
                     help='Apply spectral norm to the inference (not disc)',
                     choices = ["True", "False"])
 
+parser.add_argument('--gan-on-inputs', action='store_true',
+                    help='In addition to being the recognition model for variational inference, the inference (encoder)'
+                         ' also acts as a discriminator. wut!?')
+parser.add_argument('--VI-vs-GAN', default=.5, type=float,
+                    help="A value between 0 and 1 representing how much to favor the cost function of variational"
+                         "inference vs. that of the GAN (on inputs). 1 = all VI, 0 = all GAN")
+parser.add_argument('--lamda2', default=10, type=float,
+                    help='Lambda for the gradient penalty on the discriminator-AKA-inference network w/r/t inputs')
 
 def train(args, inference, generator, train_loader, discriminator,
-              optimizerD, optimizerG, optimizerF, epoch):
+              optimizerD, optimizerG, optimizerF, epoch, readout_disc=None, readout_optimizer=None):
     inference.train()
     generator.train()
     discriminator.train()
@@ -140,6 +152,12 @@ def train(args, inference, generator, train_loader, discriminator,
         # pass through inference
         real_out = inference(real_samples)
 
+        if args.gan_on_inputs:
+            readout_optimizer.zero_grad()
+            overall_d_out_real = (1 - args.VI_vs_GAN) * readout_disc(inference.intermediate_state_dict["Layer4"])
+            D2_loss = -overall_d_out_real.mean()
+            D2_loss += get_gradient_penalty_inputs(readout_disc, inference, real_samples, lamda=args.lamda2)
+
         Ds = discriminator(get_detached_state_dict(inference.intermediate_state_dict))
         D_loss = -(Ds).mean()
         E_loss = discriminator(inference.intermediate_state_dict).mean()
@@ -148,7 +166,7 @@ def train(args, inference, generator, train_loader, discriminator,
         # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
         # with Gaussian we have log p  = MSE between actual and predicted
         surp = None if not args.scale_gen_surprisal_by_D else Ds
-        G_loss = gen_surprisal(inference.intermediate_state_dict, generator, args.surprisal_sigma, criterion,
+        G_loss = args.VI_vs_GAN * gen_surprisal(inference.intermediate_state_dict, generator, args.surprisal_sigma, criterion,
                                surp, detach_inference=True, )
 
         if args.kl_from_sn:
@@ -166,6 +184,19 @@ def train(args, inference, generator, train_loader, discriminator,
             noise[:real_samples.size(0) // 2] = real_out[most_surprising_idx].detach()
 
         generated_down = generator(noise)
+
+        if args.gan_on_inputs:
+            inference_layer = inference(generated_down.detach(), to_layer = 4, update_states = False)
+            overall_d_out = (1 - args.VI_vs_GAN) * readout_disc(inference_layer)
+            D2_loss += overall_d_out.mean()
+            D2_loss += get_gradient_penalty_inputs(readout_disc, inference, generated_down, lamda=args.lamda2)
+
+            inference_layer = inference(generated_down, to_layer = 4, update_states = False)
+            overall_d_out = (1 - args.VI_vs_GAN) * readout_disc(inference_layer)
+            G_loss += - overall_d_out.mean()
+
+            D2_loss.backward(retain_graph=True)  # populates the encoder too; must retain
+            readout_optimizer.step()
 
         Ds_gen = discriminator(get_detached_state_dict(generator.intermediate_state_dict))
         D_loss += (Ds_gen).mean()
@@ -311,6 +342,9 @@ def main_worker(gpu, ngpus_per_node, args):
     discriminator = Discriminator(args.noise_dim, args.n_filters, nc, image_size=image_size,
                                   hard_norm=args.divisive_normalization, hidden_dim=128)
 
+    readout_disc = ReadoutDiscriminator( args.n_filters, image_size, spec_norm = args.spectral_norm) if \
+                        args.gan_on_inputs else None
+
 
 
     # get to proper GPU
@@ -322,7 +356,8 @@ def main_worker(gpu, ngpus_per_node, args):
             torch.cuda.set_device(args.gpu)
             inference.cuda(args.gpu)
             generator.cuda(args.gpu)
-
+            if args.gan_on_inputs:
+                readout_disc.cuda(args.gpu)
             discriminator.cuda(args.gpu)
             # When using a single GPU per process and per
             # DistributedDataParallel, we need to divide the batch size
@@ -331,18 +366,21 @@ def main_worker(gpu, ngpus_per_node, args):
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
             inference = torch.nn.parallel.DistributedDataParallel(inference, device_ids=[args.gpu])
             generator = torch.nn.parallel.DistributedDataParallel(generator, device_ids=[args.gpu])
+            if args.gan_on_inputs:
+                readout_disc = torch.nn.parallel.DistributedDataParallel(readout_disc, device_ids=[args.gpu])
             discriminator = torch.nn.parallel.DistributedDataParallel(discriminator, device_ids=[args.gpu])
         else:
             inference.cuda()
             generator.cuda()
-
+            if args.gan_on_inputs:
+                readout_disc.cuda()
             discriminator.cuda()
 
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
             generator = torch.nn.parallel.DistributedDataParallel(generator)
             inference = torch.nn.parallel.DistributedDataParallel(inference)
-
+            readout_disc = torch.nn.parallel.DistributedDataParallel(readout_disc) if args.gan_on_inputs else None
             discriminator = torch.nn.parallel.DistributedDataParallel(discriminator)
 
     elif args.gpu is not None:
@@ -350,25 +388,28 @@ def main_worker(gpu, ngpus_per_node, args):
         inference = inference.cuda(args.gpu)
         discriminator = discriminator.cuda(args.gpu)
         generator = generator.cuda(args.gpu)
-
+        readout_disc = readout_disc.cuda(args.gpu) if args.gan_on_inputs else None
     else:
         # DataParallel will divide and allocate batch_size to all available GPUs
         inference = torch.nn.DataParallel(inference).cuda()
         generator = torch.nn.DataParallel(generator).cuda()
         discriminator = torch.nn.DataParallel(discriminator).cuda()
+        readout_disc = torch.nn.DataParallel(readout_disc).cuda() if args.gan_on_inputs else None
 
 
     # ------ Build optimizer ------ #
-    optimizerD = optim.Adam(discriminator.parameters(), lr=args.lr_d, betas=(args.beta1, 0.999), weight_decay = args.wd)
+    optimizerD = optim.Adam(discriminator.parameters(), lr=args.lr_d, betas=(args.beta1, args.beta2), weight_decay = args.wd)
     # we want the lr to be slower for upper layers as they get more gradient flow
-    optimizerG = optim.Adam([{'params':mod.parameters(),'lr': args.lr_g * (5-i)}
-                                    for i,mod in enumerate(generator.listed_modules)],
-                     lr=args.lr_g, betas=(args.beta1, 0.999), weight_decay = args.wd)
+    optimizerG = optim.Adam(generator.parameters(),
+                     lr=args.lr_g, betas=(args.beta1, args.beta2), weight_decay = args.wd)
 
     # similarly for the encoder lower layers should have have slower lrs
-    optimizerF = optim.Adam([{'params':mod.parameters(),'lr': args.lr_e * (i+1)}
-                                    for i,mod in enumerate(inference.listed_modules)],
-                     lr=args.lr_e, betas=(args.beta1, 0.999), weight_decay = args.wd)
+    optimizerF = optim.Adam(inference.parameters(),
+                     lr=args.lr_e, betas=(args.beta1, args.beta2), weight_decay = args.wd)
+
+    optimizerRD = optim.Adam(readout_disc.parameters(),
+                     lr=args.lr_rd, betas=(args.beta1, args.beta2), weight_decay = args.wd) if \
+                        args.gan_on_inputs else None
 
     # ------ optionally resume from a checkpoint ------- #
     if args.resume:
@@ -409,7 +450,7 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
 
         train(args, inference, generator, train_loader, discriminator,
-                        optimizerD, optimizerG, optimizerF, epoch)
+                        optimizerD, optimizerG, optimizerF, epoch, readout_disc, optimizerRD)
         generator.eval()
         inference.eval()
 
@@ -427,7 +468,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                     and args.rank % ngpus_per_node == 0):
-            if (epoch % 5 == 0) or (epoch == args.epochs-1):
+            if (epoch == args.epochs-1):
                 # how well can we decode from layers?
                 accuracies = decode_classes_from_layers(  args.gpu,
                                                               inference,
@@ -435,7 +476,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                                               args.n_filters,
                                                               args.noise_dim,
                                                               args.data,
-                                                                args.dataset,
+                                                              args.dataset,
                                                               nonlinear = False,
                                                               lr = 1,
                                                               folds = 8,
@@ -455,8 +496,8 @@ def main_worker(gpu, ngpus_per_node, args):
             torch.save({
                 'epoch': epoch + 1,
                 'inference_state_dict': inference.state_dict(),
-                'generator_state_dict': inference.state_dict(),
-
+                'generator_state_dict': generator.state_dict(),
+                'readout_dict_state_dict': readout_disc.state_dict() if args.gan_on_inputs else None,
                 'discriminator_state_dict': discriminator.state_dict(),
                 'args': args,
                 'optimizerD': optimizerD.state_dict(),
@@ -466,7 +507,7 @@ def main_worker(gpu, ngpus_per_node, args):
             }, 'checkpoint.pth.tar')
 
     # For orion. Don't include lowest layer
-    best_accuracy = torch.max(accuracies.mean(dim=0)[1:]).item()
+    best_accuracy = accuracies.mean(dim=0)[-2].item()
     error_rate = 100 - best_accuracy
     report_results([dict(
         name='test_error_rate',

@@ -70,6 +70,24 @@ def get_gradient_penalty(discriminator, state_dict, lamda = 1, p=1, ):
     return gp * lamda
 
 
+def get_gradient_penalty_inputs(readout_discriminator, inference_net, input_data, lamda=10, p=2, ):
+    """Calculate the gradient of the discriminator's output w/r/t inputs,
+    and ensure the encoder changes accordingly too"""
+
+    input_data = Variable(input_data.detach(), requires_grad=True)
+    inference_layer = inference_net(input_data, to_layer=4, update_states=False)
+
+    d = readout_discriminator(inference_layer)
+    bs = d.size(0)
+
+    gradients = grad(outputs=d, inputs=input_data,
+                     grad_outputs=torch.ones(d.size()).to(d.device),
+                     create_graph=True, retain_graph=True, only_inputs=True)[0]
+
+    gp = ((gradients.view(gradients.size()[0], -1).norm(p, dim=1) - 1) ** p).mean()
+
+    return gp * lamda
+
 def stdDev(x):
     r"""
     Add a standard deviation channel to the current layer. Assumes a linear layer
@@ -108,14 +126,12 @@ def stdDev_conv(x):
 
 
 def gen_surprisal(inf_state_dict, generator, sigma2, criterion, surprisal=None,
-                  detach_inference=True, also_list=False):
+                  detach_inference=True):
     ML_loss = 0
     sig = nn.Sigmoid()
     for i, G in enumerate(generator.listed_modules):
 
         lower_h = inf_state_dict[generator.layer_names[i]]
-        lower_h = lower_h + torch.empty_like(lower_h).normal_() * sigma2
-
         upper_h = inf_state_dict[generator.layer_names[i + 1]]
 
         if detach_inference:
@@ -159,20 +175,17 @@ def get_pixelwise_channel_norms(inference, generator):
 
     return total_distance_from_1
 
-# def get_weight_alignment(generator, inference):
-#     for i, (G, F) in enumerate(zip(generator.listed_modules, inference.listed_modules)):
-#         for m in F.modules():
-#             if isinstance(m, torch.nn.Conv2d):
-#                 inf_weight = m.weight
-#                 break
-#         for m in G.modules():
-#             if isinstance(m, torch.nn.ConvTranspose2d):
-#                 gen_weight = m.weight
-#
-#         n_channels = gen_weight.size(1)
-#         inf_weight = inf_weight[:,:n_channels]
-#
-#         cosine = torch.nn.CosineSimilarity()(inf_weight.transpose(1, 0).cpu().view(1, -1),
-#                                              gen_weight.cpu().view(1, -1))
-#         angle = torch.acos(cosine).item()
-#         self.weight_alignment[self.layer_names[i]].append(angle)
+def weights_init(net):
+    for m in net.modules():
+        if isinstance(m, nn.Conv2d):
+            m.weight.data.normal_(0, 0.02)
+            if m.bias is not None:
+                m.bias.data.zero_()
+        elif isinstance(m, nn.ConvTranspose2d):
+            m.weight.data.normal_(0, 0.02)
+            if m.bias is not None:
+                m.bias.data.zero_()
+        elif isinstance(m, nn.Linear):
+            m.weight.data.normal_(0, 0.02)
+            if m.bias is not None:
+                m.bias.data.zero_()

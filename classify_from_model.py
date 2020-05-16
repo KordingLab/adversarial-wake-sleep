@@ -9,8 +9,7 @@ import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 
-
-from dcgan_models import DeterministicHelmholtz
+from dcgan_models import Inference
 from decoder_models import LinearDecoder, NonlinearDecoder
 
 import argparse
@@ -120,19 +119,16 @@ def load_cortex(path, args):
     """Loads a cortex from path."""
     bn = False if args.loss_type == 'wasserstein' else True
 
-    cortex = DeterministicHelmholtz(args.noise_dim, args.n_filters,
-                                    1 if args.dataset == 'mnist' else 3,
-                                    image_size=args.image_size,
-                                    noise_type = args.noise_type,
-                                    batchnorm = bn,
-                                    normalize = args.divisive_normalization,
-                                    he_init=args.he_initialization)
+    cortex = Inference(args.noise_dim, args.n_filters,
+                        1 if args.dataset == 'mnist' else 3,
+                        image_size=args.image_size,
+                       bn=args.bn, hard_norm=args.divisive_normalization, spec_norm=args.spec_norm, derelu=False)
 
     if os.path.isfile(path):
         print("=> loading checkpoint '{}'".format(path))
         # load onto the CPU
         checkpoint = torch.load(path,map_location=torch.device('cpu'))
-        cortex.load_state_dict(checkpoint['cortex_state_dict'])
+        cortex.load_state_dict(checkpoint['inference_state_dict'])
 
         print("=> loaded checkpoint '{}' (epoch {})"
               .format(path, checkpoint['epoch']))
@@ -142,10 +138,10 @@ def load_cortex(path, args):
     return cortex
 
 
-def train(cortex, optimizer, decoder, train_loader, gpu):
+def train(inference, optimizer, decoder, train_loader, gpu):
     """Given some training data, feed that through cortex, put all activations through decoders,
     and train the decoder on the supervised task"""
-    cortex.eval()
+    inference.eval()
     decoder.train()
 
     loss_fn = nn.CrossEntropyLoss()
@@ -155,10 +151,10 @@ def train(cortex, optimizer, decoder, train_loader, gpu):
         batch, labels = batch.cuda(gpu), labels.cuda(gpu)
 
         # run though
-        cortex.inference(batch)
+        inference(batch)
 
         # get predictions
-        predictions = decoder(cortex.inference.intermediate_state_dict)
+        predictions = decoder(inference.intermediate_state_dict)
 
         loss = 0
         for pred in predictions:
@@ -166,9 +162,9 @@ def train(cortex, optimizer, decoder, train_loader, gpu):
         loss.backward()
         optimizer.step()
 
-def test(cortex, decoder, test_loader, gpu, epoch, n_examples, verbose = False):
+def test(inference, decoder, test_loader, gpu, epoch, n_examples, verbose = False):
     """Returns the classification error and loss on this fold of the test set for each of the 5 layers + the input"""
-    cortex.eval()
+    inference.eval()
     decoder.eval()
 
     correct = [0 for _ in range(6)]
@@ -176,10 +172,10 @@ def test(cortex, decoder, test_loader, gpu, epoch, n_examples, verbose = False):
     for batch, labels in test_loader:
         batch, labels = batch.cuda(gpu), labels.cuda(gpu)
         # run though
-        cortex.inference(batch)
+        inference(batch)
 
         # get predictions
-        predictions = decoder(cortex.inference.intermediate_state_dict)
+        predictions = decoder(inference.intermediate_state_dict)
 
         # get accuracy on each layer
         total += labels.size(0)
@@ -199,7 +195,7 @@ def test(cortex, decoder, test_loader, gpu, epoch, n_examples, verbose = False):
     return accuracies
 
 def decode_classes_from_layers(gpu,
-                              cortex,
+                               inference,
                               image_size,
                               n_filters,
                               noise_dim,
@@ -299,7 +295,7 @@ def decode_classes_from_layers(gpu,
 
         # get to proper GPU
         torch.cuda.set_device(gpu)
-        cortex = cortex.cuda(gpu)
+        cortex = inference.cuda(gpu)
         decoder = decoder.cuda(gpu)
 
         # ------ Build optimizer ------ #
@@ -314,9 +310,9 @@ def decode_classes_from_layers(gpu,
         for epoch in range(epochs):
             if lr_schedule:
                 adjust_lr(epoch, optimizer, epochs)
-            train(cortex, optimizer, decoder, train_loader, gpu)
+            train(inference, optimizer, decoder, train_loader, gpu)
             if verbose or (epoch==epochs-1):
-                accuracies = test(cortex, decoder, test_loader, gpu, epoch, len(test_idx), verbose)
+                accuracies = test(inference, decoder, test_loader, gpu, epoch, len(test_idx), verbose)
 
         all_accuracies.append(accuracies)
 
