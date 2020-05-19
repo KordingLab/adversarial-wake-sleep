@@ -126,8 +126,8 @@ def stdDev_conv(x):
 
 
 def gen_surprisal(inf_state_dict, generator, sigma2, criterion, surprisal=None,
-                  detach_inference=True):
-    ML_loss = 0
+                  detach_inference=True, as_list = False):
+    ML_loss = 0 if not as_list else []
     sig = nn.Sigmoid()
     for i, G in enumerate(generator.listed_modules):
 
@@ -148,7 +148,10 @@ def gen_surprisal(inf_state_dict, generator, sigma2, criterion, surprisal=None,
         else:
             loss = criterion(x, lower_h)
 
-        ML_loss = ML_loss + loss
+        if as_list:
+            ML_loss.append(loss.detach())
+        else:
+            ML_loss = ML_loss + loss
 
     return ML_loss
 

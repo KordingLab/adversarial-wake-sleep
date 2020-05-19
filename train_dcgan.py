@@ -116,11 +116,12 @@ parser.add_argument('--divisive-normalization', default='False',
 parser.add_argument('--spectral-norm', default='False',
                     help='Apply spectral norm to the inference (not disc)',
                     choices = ["True", "False"])
-
+parser.add_argument('--detailed-logging', action='store_true',
+                    help='Print and log things')
 parser.add_argument('--gan-on-inputs', action='store_true',
                     help='In addition to being the recognition model for variational inference, the inference (encoder)'
                          ' also acts as a discriminator. wut!?')
-parser.add_argument('--VI-vs-GAN', default=.5, type=float,
+parser.add_argument('--VI-vs-GAN', default=1., type=float,
                     help="A value between 0 and 1 representing how much to favor the cost function of variational"
                          "inference vs. that of the GAN (on inputs). 1 = all VI, 0 = all GAN")
 parser.add_argument('--lamda2', default=10, type=float,
@@ -154,13 +155,13 @@ def train(args, inference, generator, train_loader, discriminator,
 
         if args.gan_on_inputs:
             readout_optimizer.zero_grad()
-            overall_d_out_real = (1 - args.VI_vs_GAN) * readout_disc(inference.intermediate_state_dict["Layer4"])
-            D2_loss = -overall_d_out_real.mean()
-            D2_loss += get_gradient_penalty_inputs(readout_disc, inference, real_samples, lamda=args.lamda2)
+            overall_d_out_real = readout_disc(inference.intermediate_state_dict["Layer4"])
+            D2_loss = -(1 - args.VI_vs_GAN) * overall_d_out_real.mean()
+            D2_loss += (1 - args.VI_vs_GAN) * get_gradient_penalty_inputs(readout_disc, inference, real_samples, lamda=args.lamda2)
 
         Ds = discriminator(get_detached_state_dict(inference.intermediate_state_dict))
-        D_loss = -(Ds).mean()
-        E_loss = discriminator(inference.intermediate_state_dict).mean()
+        D_loss = -args.VI_vs_GAN * (Ds).mean()
+        E_loss = args.VI_vs_GAN * discriminator(inference.intermediate_state_dict).mean()
 
         # now update generator
         # here we have to a assume a noise model in order to calculate p(h_1 | h_2 ; G)
@@ -170,7 +171,7 @@ def train(args, inference, generator, train_loader, discriminator,
                                surp, detach_inference=True, )
 
         if args.kl_from_sn:
-            E_loss = E_loss + KLfromSN(real_out)
+            E_loss = E_loss + 1e-4 * KLfromSN(real_out)
 
         ############### SLEEP ##################
 
@@ -187,26 +188,27 @@ def train(args, inference, generator, train_loader, discriminator,
 
         if args.gan_on_inputs:
             inference_layer = inference(generated_down.detach(), to_layer = 4, update_states = False)
-            overall_d_out = (1 - args.VI_vs_GAN) * readout_disc(inference_layer)
-            D2_loss += overall_d_out.mean()
-            D2_loss += get_gradient_penalty_inputs(readout_disc, inference, generated_down, lamda=args.lamda2)
+            overall_d_out = readout_disc(inference_layer)
+            D2_loss += (1 - args.VI_vs_GAN) * overall_d_out.mean()
+            D2_loss += (1 - args.VI_vs_GAN) * get_gradient_penalty_inputs(readout_disc, inference, generated_down,
+                                                                          lamda=args.lamda2)
 
             inference_layer = inference(generated_down, to_layer = 4, update_states = False)
-            overall_d_out = (1 - args.VI_vs_GAN) * readout_disc(inference_layer)
-            G_loss += - overall_d_out.mean()
+            overall_d_out = readout_disc(inference_layer)
+            G_loss += - (1 - args.VI_vs_GAN) * overall_d_out.mean()
 
             D2_loss.backward(retain_graph=True)  # populates the encoder too; must retain
             readout_optimizer.step()
 
         Ds_gen = discriminator(get_detached_state_dict(generator.intermediate_state_dict))
-        D_loss += (Ds_gen).mean()
+        D_loss += args.VI_vs_GAN * (Ds_gen).mean()
 
         # center the discriminator
         if args.scale_gen_surprisal_by_D:
             D_loss += torch.norm((Ds_gen).mean() + (Ds).mean())
 
-        D_loss += get_gradient_penalty(discriminator, generator.intermediate_state_dict, lamda = args.lamda, p=1)
-        D_loss += get_gradient_penalty(discriminator, inference.intermediate_state_dict, lamda = args.lamda, p=1)
+        D_loss += args.VI_vs_GAN * get_gradient_penalty(discriminator, generator.intermediate_state_dict, lamda = args.lamda, p=1)
+        D_loss += args.VI_vs_GAN * get_gradient_penalty(discriminator, inference.intermediate_state_dict, lamda = args.lamda, p=1)
 
         D_loss.backward()
         if args.gradient_clipping > 0:
@@ -443,6 +445,38 @@ def main_worker(gpu, ngpus_per_node, args):
         args.start_epoch = 0
 
     decoding_error_history = []
+    reconstruction_history = []
+    decoding_error_std_history = []
+    reconstruction_std_history = []
+
+    if args.detailed_logging:
+        # how well can we decode from layers?
+        accuracies, reconstructions = decode_classes_from_layers(args.gpu,
+                                                                 inference,
+                                                                 generator,
+                                                                 image_size,
+                                                                 args.n_filters,
+                                                                 args.noise_dim,
+                                                                 args.data,
+                                                                 args.dataset,
+                                                                 nonlinear=False,
+                                                                 lr=1,
+                                                                 folds=4,
+                                                                 epochs=20,
+                                                                 hidden_size=1000,
+                                                                 wd=1e-3,
+                                                                 opt='sgd',
+                                                                 lr_schedule=True,
+                                                                 verbose=False,
+                                                                 batch_size=args.batch_size,
+                                                                 workers=args.workers)
+        print("Epoch {}".format(-1))
+        for i in range(6):
+            print("Layer{}: Accuracy {} +/- {}".format(i, accuracies.mean(dim=0)[i], accuracies.std(dim=0)[i]))
+        decoding_error_history.append(accuracies.mean(dim=0).detach().cpu())
+        reconstruction_history.append(reconstructions.mean(dim=0).detach().cpu())
+        decoding_error_std_history.append(accuracies.std(dim=0).detach().cpu())
+        reconstruction_std_history.append(reconstructions.std(dim=0).detach().cpu())
 
     for epoch in range(args.start_epoch, args.epochs):
 
@@ -468,10 +502,11 @@ def main_worker(gpu, ngpus_per_node, args):
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                     and args.rank % ngpus_per_node == 0):
-            if (epoch == args.epochs-1):
+            if args.detailed_logging or (epoch == args.epochs-1):
                 # how well can we decode from layers?
-                accuracies = decode_classes_from_layers(  args.gpu,
+                accuracies, reconstructions = decode_classes_from_layers(  args.gpu,
                                                               inference,
+                                                              generator,
                                                               image_size,
                                                               args.n_filters,
                                                               args.noise_dim,
@@ -479,7 +514,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                                               args.dataset,
                                                               nonlinear = False,
                                                               lr = 1,
-                                                              folds = 8,
+                                                              folds = 4,
                                                               epochs = 20,
                                                               hidden_size = 1000,
                                                               wd = 1e-3,
@@ -492,6 +527,9 @@ def main_worker(gpu, ngpus_per_node, args):
                 for i in range(6):
                     print("Layer{}: Accuracy {} +/- {}".format(i, accuracies.mean(dim=0)[i],accuracies.std(dim=0)[i]))
                 decoding_error_history.append(accuracies.mean(dim=0).detach().cpu())
+                reconstruction_history.append(reconstructions.mean(dim=0).detach().cpu())
+                decoding_error_std_history.append(accuracies.std(dim=0).detach().cpu())
+                reconstruction_std_history.append(reconstructions.std(dim=0).detach().cpu())
 
             torch.save({
                 'epoch': epoch + 1,
@@ -503,7 +541,11 @@ def main_worker(gpu, ngpus_per_node, args):
                 'optimizerD': optimizerD.state_dict(),
                 'optimizerG': optimizerG.state_dict(),
                 'optimizerF': optimizerF.state_dict(),
-                'train_history': {"decoding_error_history": decoding_error_history}
+                'train_history': {"decoding_error_history": decoding_error_history,
+                                  "reconstruction_history": reconstruction_history,
+                                  "decoding_error_std_history": decoding_error_std_history,
+                                  "reconstruction_std_history": reconstruction_std_history
+                                  }
             }, 'checkpoint.pth.tar')
 
     # For orion. Don't include lowest layer

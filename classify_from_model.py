@@ -9,8 +9,9 @@ import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 
-from dcgan_models import Inference
+from dcgan_models import Inference, Generator
 from decoder_models import LinearDecoder, NonlinearDecoder
+from utils import gen_surprisal
 
 import argparse
 import os
@@ -92,25 +93,26 @@ def main(args):
     if args.gpu is not None:
         warnings.warn('You have chosen a specific GPU. ')
 
-    cortex = load_cortex(args.path, args)
+    inference,generator = load_cortex(args.path, args)
 
-    accuracies =   decode_classes_from_layers(args.gpu,
-                                              cortex,
-                                              args.image_size,
-                                              args.n_filters,
-                                              args.noise_dim,
-                                              args.data,
-                                              args.dataset,
-                                              args.nonlinear,
-                                              args.lr,
-                                              args.n_folds,
-                                              args.epochs,
-                                              args.hidden_size,
-                                              args.wd,
-                                              args.opt,
-                                              args.lr_schedule,
-                                              args.batch_size,
-                                              args.workers)
+    accuracies, reconstructions =  decode_classes_from_layers(args.gpu,
+                                                              inference,
+                                                              generator,
+                                                              args.image_size,
+                                                              args.n_filters,
+                                                              args.noise_dim,
+                                                              args.data,
+                                                              args.dataset,
+                                                              args.nonlinear,
+                                                              args.lr,
+                                                              args.n_folds,
+                                                              args.epochs,
+                                                              args.hidden_size,
+                                                              args.wd,
+                                                              args.opt,
+                                                              args.lr_schedule,
+                                                              args.batch_size,
+                                                              args.workers)
 
     for i in range(6):
         print("Layer{}: Accuracy {} +/- {}".format(i, accuracies.mean(dim=0)[i],accuracies.std(dim=0)[i]))
@@ -119,23 +121,26 @@ def load_cortex(path, args):
     """Loads a cortex from path."""
     bn = False if args.loss_type == 'wasserstein' else True
 
-    cortex = Inference(args.noise_dim, args.n_filters,
+    inference = Inference(args.noise_dim, args.n_filters,
                         1 if args.dataset == 'mnist' else 3,
                         image_size=args.image_size,
                        bn=args.bn, hard_norm=args.divisive_normalization, spec_norm=args.spec_norm, derelu=False)
+    generator = Generator(args.noise_dim, args.n_filters, 1 if args.dataset == 'mnist' else 3,
+                          image_size=args.image_size,
+                          hard_norm=args.divisive_normalization)
 
     if os.path.isfile(path):
         print("=> loading checkpoint '{}'".format(path))
         # load onto the CPU
         checkpoint = torch.load(path,map_location=torch.device('cpu'))
-        cortex.load_state_dict(checkpoint['inference_state_dict'])
-
+        inference.load_state_dict(checkpoint['inference_state_dict'])
+        generator.load_state_dict(checkpoint['generator_state_dict'])
         print("=> loaded checkpoint '{}' (epoch {})"
               .format(path, checkpoint['epoch']))
     else:
         raise IOError("=> no checkpoint found at '{}'".format(path))
 
-    return cortex
+    return inference,generator
 
 
 def train(inference, optimizer, decoder, train_loader, gpu):
@@ -162,13 +167,16 @@ def train(inference, optimizer, decoder, train_loader, gpu):
         loss.backward()
         optimizer.step()
 
-def test(inference, decoder, test_loader, gpu, epoch, n_examples, verbose = False):
+def test(inference, generator, decoder, test_loader, gpu, epoch, n_examples, verbose = False):
     """Returns the classification error and loss on this fold of the test set for each of the 5 layers + the input"""
     inference.eval()
     decoder.eval()
+    generator.eval()
 
     correct = [0 for _ in range(6)]
     total = 0
+    criterion = nn.MSELoss()
+    reconstruction_losses = torch.zeros(5)
     for batch, labels in test_loader:
         batch, labels = batch.cuda(gpu), labels.cuda(gpu)
         # run though
@@ -178,10 +186,15 @@ def test(inference, decoder, test_loader, gpu, epoch, n_examples, verbose = Fals
         predictions = decoder(inference.intermediate_state_dict)
 
         # get accuracy on each layer
+        # also get the reconstruction losses
+        reconstructions = gen_surprisal(inference.intermediate_state_dict, generator, 1, criterion,
+                      None, detach_inference=True, as_list = True)
         total += labels.size(0)
         for i in range(6):
             _, predicted = torch.max(predictions[i].data, 1)
             correct[i] += float((predicted == labels).sum().item())
+
+        reconstruction_losses += torch.Tensor(reconstructions) * labels.size(0)
 
     accuracies = []
     if verbose:
@@ -191,11 +204,13 @@ def test(inference, decoder, test_loader, gpu, epoch, n_examples, verbose = Fals
         accuracies.append(accuracy)
         if verbose:
             print('Layer{}: {}'.format(i, accuracy))
+    reconstruction_losses /= total
 
-    return accuracies
+    return accuracies, reconstruction_losses
 
 def decode_classes_from_layers(gpu,
-                               inference,
+                              inference,
+                              generator,
                               image_size,
                               n_filters,
                               noise_dim,
@@ -266,6 +281,7 @@ def decode_classes_from_layers(gpu,
     n_test_examples = len(all_test_dataset) // folds
 
     all_accuracies = []
+    all_reconstructions = []
     for f in range(folds):
         # ---- Get CV indices ----
         test_idx = perm[f * n_test_examples: (f+1) * n_test_examples]
@@ -295,7 +311,8 @@ def decode_classes_from_layers(gpu,
 
         # get to proper GPU
         torch.cuda.set_device(gpu)
-        cortex = inference.cuda(gpu)
+        inference = inference.cuda(gpu)
+        generator = generator.cuda(gpu)
         decoder = decoder.cuda(gpu)
 
         # ------ Build optimizer ------ #
@@ -312,11 +329,12 @@ def decode_classes_from_layers(gpu,
                 adjust_lr(epoch, optimizer, epochs)
             train(inference, optimizer, decoder, train_loader, gpu)
             if verbose or (epoch==epochs-1):
-                accuracies = test(inference, decoder, test_loader, gpu, epoch, len(test_idx), verbose)
+                accuracies, reconstructions = test(inference, generator, decoder, test_loader, gpu, epoch, len(test_idx), verbose)
 
         all_accuracies.append(accuracies)
+        all_reconstructions.append(reconstructions)
 
-    return torch.Tensor(all_accuracies)
+    return torch.Tensor(all_accuracies), torch.stack(all_reconstructions)
 
 def adjust_lr(epoch, optimizer,epochs):
     if epoch %(epochs//3)==0:
