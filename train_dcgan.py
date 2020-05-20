@@ -12,7 +12,7 @@ import torch.distributed as dist
 
 
 
-from dcgan_models import Inference, Generator, Discriminator, ReadoutDiscriminator
+from dcgan_models import Inference, Generator, Discriminator, ReadoutDiscriminator, DeReLU
 from utils import sv_img, KLfromSN, gen_surprisal, get_detached_state_dict, get_gradient_penalty, get_gradient_penalty_inputs
 
 import argparse
@@ -126,6 +126,9 @@ parser.add_argument('--VI-vs-GAN', default=1., type=float,
                          "inference vs. that of the GAN (on inputs). 1 = all VI, 0 = all GAN")
 parser.add_argument('--lamda2', default=10, type=float,
                     help='Lambda for the gradient penalty on the discriminator-AKA-inference network w/r/t inputs')
+parser.add_argument('--lr-decay', default=10000, type=int,
+                    help='How many epochs between decaying by factor of 10')
+
 
 def train(args, inference, generator, train_loader, discriminator,
               optimizerD, optimizerG, optimizerF, epoch, readout_disc=None, readout_optimizer=None):
@@ -480,6 +483,9 @@ def main_worker(gpu, ngpus_per_node, args):
 
     for epoch in range(args.start_epoch, args.epochs):
 
+        adjust_learning_rates([optimizerF,optimizerD,optimizerG,optimizerRD],
+                              epoch, args, inference, generator, discriminator)
+
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
@@ -555,6 +561,21 @@ def main_worker(gpu, ngpus_per_node, args):
         name='test_error_rate',
         type='objective',
         value=error_rate)])
+
+def adjust_learning_rates(optimizers, epoch, args, inference, generation, discriminator):
+    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+
+    if epoch >0 and epoch % args.lr_decay == 0:
+        # for optimizer in optimizers:
+        #     for param_group in optimizer.param_groups:
+        #         param_group['lr'] = param_group['lr']/10
+
+        generation.sigma2 /= 10
+        inference.sigma2 /= 10
+        discriminator.sigma2 /= 10
+        for m in inference.modules():
+            if isinstance(m, DeReLU):
+                m.scale.data = m.scale.data/10
 
 if __name__ == '__main__':
     args = parser.parse_args()

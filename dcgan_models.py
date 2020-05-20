@@ -231,7 +231,7 @@ class Discriminator(nn.Module):
         self.relu = nn.LeakyReLU()
         self.normalizer = NormalizationLayer() if hard_norm else null()
         self.dropout = nn.Dropout(dropout)
-
+        self.sigma2 = 0.01
         weights_init(self)
 
     def forward(self, state):
@@ -242,6 +242,8 @@ class Discriminator(nn.Module):
                        self.linear23(torch.cat([ins[2], ins[3]], dim=1)),
                        self.linear34(torch.cat([ins[3], ins[4]], dim=1)),
                        self.linear45(torch.cat([ins[4], ins[5]], dim=1))], dim=1)
+        noise = torch.empty_like(x).normal_() * self.sigma2
+        x = x + noise
 
         x = self.relu(x)
         x = self.dropout(x)
