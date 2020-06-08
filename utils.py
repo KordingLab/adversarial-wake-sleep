@@ -125,7 +125,7 @@ def stdDev_conv(x):
     return torch.cat([x, y], dim=1)
 
 
-def gen_surprisal(inf_state_dict, generator, sigma2, criterion, surprisal=None,
+def gen_surprisal(inf_state_dict, generator, criterion, surprisal=None,
                   detach_inference=True, as_list = False):
     ML_loss = 0 if not as_list else []
     sig = nn.Sigmoid()
@@ -192,3 +192,11 @@ def weights_init(net):
             m.weight.data.normal_(0, 0.02)
             if m.bias is not None:
                 m.bias.data.zero_()
+
+
+def promote_attributes(dataparallel_mod):
+    dataparallel_mod.listed_modules = dataparallel_mod.module.listed_modules
+    dataparallel_mod.intermediate_state_dict = dataparallel_mod.module.intermediate_state_dict
+    dataparallel_mod.activations = dataparallel_mod.module.activations
+    dataparallel_mod.layer_names = dataparallel_mod.module.layer_names
+    dataparallel_mod.sigma2 = dataparallel_mod.module.sigma2
