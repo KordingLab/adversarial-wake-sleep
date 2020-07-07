@@ -1,7 +1,9 @@
 
 # Adversarial Wake-Sleep
 
-This repository accompanies **An adversarial algorithm for variational inference with a new role for acetylcholine** https://arxiv.org/abs/2006.10811. It is a pytorch implementation of the adversarial wake-sleep algorithm. This is a hypothesis for learning in biological circuits:
+This repository accompanies **An adversarial algorithm for variational inference with a new role for acetylcholine** https://arxiv.org/abs/2006.10811. It is a pytorch implementation of the Adversarial Wake-Sleep algorithm. 
+
+## The algorithm (in figures)
 
 
 <img src="figures/bio-schematic.png"  width="250"/>
