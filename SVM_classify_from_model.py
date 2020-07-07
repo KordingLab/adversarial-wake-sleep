@@ -8,6 +8,7 @@ from torch.utils.data import Subset
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
+import  numpy as np
 
 from dcgan_models import Inference, Generator
 from decoder_models import LinearDecoder, NonlinearDecoder
@@ -18,6 +19,9 @@ import os
 import random
 import warnings
 
+from sklearn.linear_model import SGDClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
 
 
 parser = argparse.ArgumentParser(description='Generate and save images of a network checkpoint.')
@@ -79,6 +83,11 @@ parser.add_argument('--divisive-normalization', action='store_true',
 parser.add_argument('--lr-schedule', action='store_true',
                     help='Learning rate *=.1 halfway through.')
 
+parser.add_argument('--alpha', default=1e-3, type=float,
+                    help='svm regularization',
+                   )
+
+
 def main(args):
     if args.seed is not None:
         random.seed(args.seed)
@@ -93,137 +102,94 @@ def main(args):
     if args.gpu is not None:
         warnings.warn('You have chosen a specific GPU. ')
 
-    inference,generator = load_cortex(args.path, args)
+    inference = load_cortex(args.path, args)
 
-    accuracies, reconstructions =  decode_classes_from_layers(args.gpu,
-                                                              inference,
-                                                              generator,
-                                                              args.image_size,
-                                                              args.n_filters,
-                                                              args.noise_dim,
-                                                              args.data,
-                                                              args.dataset,
-                                                              args.nonlinear,
-                                                              args.lr,
-                                                              args.n_folds,
-                                                              args.epochs,
-                                                              args.hidden_size,
-                                                              args.wd,
-                                                              args.opt,
-                                                              args.lr_schedule,
-                                                              args.batch_size,
-                                                              args.workers)
-
+    accuracies =  np.array(decode_classes_from_layers(args.gpu,
+                                          inference,
+                                          args.image_size,
+                                          args.data,
+                                          args.dataset,
+                                          folds = args.n_folds,
+                                          epochs = args.epochs,
+                                          batch_size = args.batch_size,
+                                          workers = args.workers))
     for i in range(6):
-        print("Layer{}: Accuracy {} +/- {}".format(i, accuracies.mean(dim=0)[i],accuracies.std(dim=0)[i]))
+        print("Layer{}: Accuracy {} +/- {}".format(i, accuracies.mean(0)[i],accuracies.std(0)[i]))
 
 def load_cortex(path, args):
     """Loads a cortex from path."""
-    bn = False if args.loss_type == 'wasserstein' else True
 
     inference = Inference(args.noise_dim, args.n_filters,
                         1 if args.dataset == 'mnist' else 3,
                         image_size=args.image_size,
-                       bn=args.bn, hard_norm=args.divisive_normalization, spec_norm=args.spec_norm, derelu=False)
-    generator = Generator(args.noise_dim, args.n_filters, 1 if args.dataset == 'mnist' else 3,
-                          image_size=args.image_size,
-                          hard_norm=args.divisive_normalization)
+                       bn=True, hard_norm=args.divisive_normalization, spec_norm=False, derelu=True)
+
 
     if os.path.isfile(path):
         print("=> loading checkpoint '{}'".format(path))
         # load onto the CPU
         checkpoint = torch.load(path,map_location=torch.device('cpu'))
         inference.load_state_dict(checkpoint['inference_state_dict'])
-        generator.load_state_dict(checkpoint['generator_state_dict'])
         print("=> loaded checkpoint '{}' (epoch {})"
               .format(path, checkpoint['epoch']))
     else:
         raise IOError("=> no checkpoint found at '{}'".format(path))
 
-    return inference,generator
+    return inference
 
 
-def train(inference, optimizer, decoder, train_loader, gpu):
+def train(inference, decoders,scalers, train_loader, gpu):
     """Given some training data, feed that through cortex, put all activations through decoders,
     and train the decoder on the supervised task"""
     inference.eval()
-    decoder.train()
-
-    loss_fn = nn.CrossEntropyLoss()
 
     for batch, labels in train_loader:
-        optimizer.zero_grad()
-        batch, labels = batch.cuda(gpu), labels.cuda(gpu)
+        batch = batch.cuda(gpu)
 
         # run though
         inference(batch)
 
-        # get predictions
-        predictions = decoder(inference.intermediate_state_dict)
+        for i, (decoder, scaler) in enumerate(zip(decoders, scalers)):
+            layer_name = inference.layer_names[i]
+            data = inference.intermediate_state_dict[layer_name].cpu().detach().view(batch.size(0), -1)
+            scaler.partial_fit(data)
+            decoder.partial_fit(scaler.transform(data), labels, classes = range(10))
 
-        loss = 0
-        for pred in predictions:
-            loss = loss + loss_fn(pred, labels)
-        loss.backward()
-        optimizer.step()
 
-def test(inference, generator, decoder, test_loader, gpu, epoch, n_examples, verbose = False):
+
+def test(inference, decoders, scalers,test_loader, gpu):
     """Returns the classification error and loss on this fold of the test set for each of the 5 layers + the input"""
     inference.eval()
-    decoder.eval()
-    generator.eval()
 
     correct = [0 for _ in range(6)]
-    total = 0
-    criterion = nn.MSELoss()
-    reconstruction_losses = torch.zeros(5)
+    n = 0
+
     for batch, labels in test_loader:
-        batch, labels = batch.cuda(gpu), labels.cuda(gpu)
+        batch = batch.cuda(gpu)
         # run though
         inference(batch)
 
         # get predictions
-        predictions = decoder(inference.intermediate_state_dict)
+        for i, (decoder, scaler) in enumerate(zip(decoders, scalers)):
+            layer_name = inference.layer_names[i]
+            data = inference.intermediate_state_dict[layer_name].cpu().detach().view(batch.size(0),-1)
+            predictions = decoder.predict(scaler.transform(data))
 
-        # get accuracy on each layer
-        # also get the reconstruction losses
-        reconstructions = gen_surprisal(inference.intermediate_state_dict, generator, 1, criterion,
-                      None, detach_inference=True, as_list = True)
-        total += labels.size(0)
-        for i in range(6):
-            _, predicted = torch.max(predictions[i].data, 1)
-            correct[i] += float((predicted == labels).sum().item())
+            n_right = (predictions==labels.numpy()).sum()
+            correct[i] += n_right
+        n += int(batch.size(0))
 
-        reconstruction_losses += torch.Tensor(reconstructions) * labels.size(0)
+    accuracies = np.array(correct)/(float(n))
 
-    accuracies = []
-    if verbose:
-        print('Epoch {}: accuracy on {} test images:'.format(epoch, n_examples))
-    for i in range(6):
-        accuracy = 100 * correct[i] / total
-        accuracies.append(accuracy)
-        if verbose:
-            print('Layer{}: {}'.format(i, accuracy))
-    reconstruction_losses /= total
-
-    return accuracies, reconstruction_losses
+    return accuracies
 
 def decode_classes_from_layers(gpu,
                               inference,
-                              generator,
                               image_size,
-                              n_filters,
-                              noise_dim,
                               data_path,
                               dataset,
-                              nonlinear = False,
-                              lr = 0.001,
                               folds = 10,
                               epochs = 50,
-                              hidden_size = 1000,
-                              wd = 1e-4,
-                              opt = 'adam',
-                              lr_schedule = False,
                               batch_size = 128,
                               workers = 4,
                               verbose = True):
@@ -280,9 +246,10 @@ def decode_classes_from_layers(gpu,
     perm = torch.randperm(len(all_test_dataset))
     n_test_examples = len(all_test_dataset) // folds
 
-    all_accuracies = []
-    all_reconstructions = []
+    accuracies = []
     for f in range(folds):
+        if verbose:
+            print("Fold {}".format(f))
         # ---- Get CV indices ----
         test_idx = perm[f * n_test_examples: (f+1) * n_test_examples]
         if f==folds-1:
@@ -304,42 +271,23 @@ def decode_classes_from_layers(gpu,
             num_workers=workers, pin_memory=True,)
 
         # ----- Build decoder ------
-        if nonlinear:
-            decoder = NonlinearDecoder(image_size, noise_dim, n_classes, nc, n_filters, hidden_size)
-        else:
-            decoder = LinearDecoder(image_size, noise_dim, n_classes, nc, n_filters)
+        decoders = [SGDClassifier(max_iter=1000, tol=1e-3, alpha=args.alpha, penalty='elasticnet', n_jobs = 6,
+                                  learning_rate='optimal') for _ in range(6)]
+        scalers = [StandardScaler() for _ in range(6)]
 
         # get to proper GPU
         torch.cuda.set_device(gpu)
         inference = inference.cuda(gpu)
-        generator = generator.cuda(gpu)
-        decoder = decoder.cuda(gpu)
 
-        # ------ Build optimizer ------ #
-
-        if opt == 'adam':
-            optimizer = optim.Adam(decoder.parameters(), lr=lr, betas=(.9, 0.999), weight_decay = wd)
-        elif opt == 'sgd':
-            optimizer = optim.SGD(decoder.parameters(), lr=lr, momentum = 0.9, weight_decay = wd)
-        else:
-            raise AssertionError("This optimizer not implemented yet.")
 
         for epoch in range(epochs):
-            if lr_schedule:
-                adjust_lr(epoch, optimizer, epochs)
-            train(inference, optimizer, decoder, train_loader, gpu)
+
+            train(inference, decoders, scalers, train_loader, gpu)
             if verbose or (epoch==epochs-1):
-                accuracies, reconstructions = test(inference, generator, decoder, test_loader, gpu, epoch, len(test_idx), verbose)
-
-        all_accuracies.append(accuracies)
-        all_reconstructions.append(reconstructions)
-
-    return torch.Tensor(all_accuracies), torch.stack(all_reconstructions)
-
-def adjust_lr(epoch, optimizer,epochs):
-    if epoch %(epochs//3)==0:
-        for param_group in optimizer.param_groups:
-            param_group['lr'] *= .3
+                accuracy = test(inference, decoders,scalers, test_loader, gpu)
+                print("Epoch {} Accuracies {}".format(epoch, accuracy))
+        accuracies.append(accuracy)
+    return accuracies
 
 if __name__ == '__main__':
     args = parser.parse_args()
